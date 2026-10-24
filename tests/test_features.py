@@ -68,6 +68,48 @@ def test_compute_pinch_anchor_and_hand_size():
     assert set(f.curl) == set(features.FINGERS)
 
 
+def test_spread_together_vs_apart():
+    together = _hand()
+    apart = list(together)
+    for idx, dx in ((8, -0.05), (12, -0.02), (16, 0.04), (20, 0.1)):
+        x, y, z = apart[idx]
+        apart[idx] = (x + dx, y, z)
+    s_t = features.spread_ratio(together)
+    s_a = features.spread_ratio(apart)
+    assert s_t == pytest.approx(0.02 / 0.06)
+    assert s_a > 1.0 > s_t
+
+
+def test_spread_degenerate_is_zero():
+    assert features.spread_ratio([(0.0, 0.0, 0.0)] * 21) == 0.0
+
+
+def _palm_image():
+    # มือขวา ฝ่ามือเข้ากล้อง ภาพ mirror: ข้อมือล่าง, นิ้วชี้โคนซ้ายบน, นิ้วก้อยโคนขวาบน
+    image = [(0.5, 0.5, 0.0)] * 21
+    image[0] = (0.5, 0.8, 0.0)
+    image[5] = (0.4, 0.5, 0.0)
+    image[17] = (0.6, 0.5, 0.0)
+    return image
+
+
+def test_palm_facing_sign_conventions():
+    world = _hand()
+    img = _palm_image()
+    for hand, mirrored, sign in (("right", True, 1), ("left", True, -1),
+                                 ("right", False, -1), ("left", False, 1)):
+        f = features.compute(img, world, 1.0, handedness=hand, mirrored=mirrored)
+        assert f.palm_facing * sign > 0.5, (hand, mirrored)
+    assert -1.0 <= f.palm_facing <= 1.0
+
+
+def test_palm_facing_flips_when_back_of_hand():
+    img = _palm_image()
+    img[5], img[17] = img[17], img[5]  # สลับซ้าย/ขวา = หันหลังมือเข้ากล้อง
+    f = features.compute(img, _hand(), 1.0)
+    assert f.palm_facing < -0.5
+
+
 def test_hand_size_corrects_for_aspect():
     # ระยะแนวนอน 0.3 ของความกว้างภาพ 4:3 = 0.4 ของความสูงภาพ
     image = [(0.0, 0.0, 0.0)] * 21

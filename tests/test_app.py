@@ -290,3 +290,111 @@ def test_camera_wait_opened_semantics():
     cam._opened.set()
     assert cam.wait_opened(0.01) is False
     assert _cam().wait_opened(0.01) is False
+
+
+# --- Controller (ท่ามือ → motion → mouse) ---
+
+from airmouse.app import Controller  # noqa: E402
+from airmouse.features import HandFeatures  # noqa: E402
+from airmouse.gestures import GestureState  # noqa: E402
+
+
+class FakeGestures:
+    def __init__(self, states):
+        self.states = list(states)
+
+    def update(self, feats, ts):
+        return self.states.pop(0)
+
+
+class FakeMotion:
+    speed = gain = 0.0
+
+    def __init__(self):
+        self.resets = []
+        self.updates = []
+
+    def reset(self, xy):
+        self.resets.append(xy)
+
+    def update(self, anchor, hand_size, aspect, dt):
+        self.updates.append((anchor, dt))
+        return (100.0 + len(self.updates), 50.0)
+
+
+class FakeMouse:
+    def __init__(self):
+        self.user_moved = False
+        self.targets = []
+        self.active = []
+        self.resyncs = 0
+
+    def resync(self):
+        self.resyncs += 1
+        self.user_moved = False
+        return (10.0, 20.0)
+
+    def set_target(self, x, y, frame_interval):
+        self.targets.append((x, y, frame_interval))
+
+    def set_active(self, active):
+        self.active.append(active)
+
+
+def _feats():
+    return HandFeatures(curl={}, pinch=0.1, hand_size=0.2, anchor=(0.5, 0.5))
+
+
+ON = GestureState(True, False, 0.0, False, False)
+OFF = GestureState(False, False, 0.0, False, False)
+CLUTCH = GestureState(True, True, 0.0, False, True)
+
+
+def _controller(states):
+    m, mouse = FakeMotion(), FakeMouse()
+    return Controller(FakeGestures(states), m, mouse), m, mouse
+
+
+def test_controller_disabled_never_moves():
+    c, m, mouse = _controller([OFF, OFF])
+    c.step(_feats(), 1.0, 4 / 3)
+    c.step(_feats(), 1.033, 4 / 3)
+    assert mouse.targets == [] and m.updates == []
+    assert mouse.active == [False, False]
+
+
+def test_controller_resyncs_when_control_starts_then_moves():
+    c, m, mouse = _controller([OFF, ON, ON])
+    c.step(_feats(), 1.0, 4 / 3)
+    c.step(_feats(), 1.05, 4 / 3)
+    c.step(_feats(), 1.10, 4 / 3)
+    assert m.resets == [(10.0, 20.0)] and mouse.resyncs == 1
+    assert len(mouse.targets) == 2
+    assert mouse.targets[-1][2] == pytest.approx(0.05)  # frame interval = dt ของกล้อง
+    assert mouse.active == [False, True, True]
+
+
+def test_controller_clutch_stops_and_release_resyncs():
+    c, m, mouse = _controller([ON, CLUTCH, CLUTCH, ON])
+    for i in range(4):
+        c.step(_feats(), 1.0 + i * 0.033, 4 / 3)
+    assert mouse.active == [True, False, False, True]
+    assert len(m.resets) == 2  # ตอนเริ่ม และตอนปล่อย clutch
+    assert len(mouse.targets) == 2
+
+
+def test_controller_hand_lost_deactivates_and_resyncs_on_return():
+    c, m, mouse = _controller([ON, ON, ON])
+    c.step(_feats(), 1.0, 4 / 3)
+    c.step(None, 1.033, 4 / 3)
+    c.step(_feats(), 1.066, 4 / 3)
+    assert mouse.active == [True, False, True]
+    assert len(m.resets) == 2
+
+
+def test_controller_user_mouse_move_resyncs():
+    c, m, mouse = _controller([ON, ON])
+    c.step(_feats(), 1.0, 4 / 3)
+    mouse.user_moved = True
+    c.step(_feats(), 1.033, 4 / 3)
+    assert len(m.resets) == 2 and not mouse.user_moved

@@ -50,6 +50,8 @@ class GestureConfig:
     switcher_hold_ms: int = 300
     switcher_step: float = 0.6
     min_presence: float = 0.6
+    palm_spread: float = 0.9
+    palm_facing_min: float = 0.3
 
 
 @dataclass

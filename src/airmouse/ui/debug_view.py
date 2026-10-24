@@ -17,6 +17,7 @@ HAND_CONNECTIONS = (
 )
 PANEL_W = 280
 PINCH_SCALE_M = 0.12  # ความยาวแถบ pinch เต็มหลอด
+SPREAD_SCALE = 2.0    # ความยาวแถบ spread เต็มหลอด
 
 BG = QColor(24, 24, 28)
 TEXT = QColor(230, 230, 235)
@@ -29,6 +30,14 @@ JOINT = QColor(0, 200, 255)
 ANCHOR = QColor(80, 255, 80)
 
 
+def _state_label(g) -> tuple[str, QColor]:
+    if not g.enabled:
+        return "OFF (แบมือค้างเพื่อเปิด)", MUTED
+    if g.clutch:
+        return "CLUTCH", YELLOW
+    return "ON", GREEN
+
+
 class DebugView(QWidget):
     def __init__(self, inference, gesture: GestureConfig):
         super().__init__()
@@ -36,7 +45,7 @@ class DebugView(QWidget):
         self._g = gesture
         self._result = None
         self.setWindowTitle("Air Mouse — debug view (Esc เพื่อออก)")
-        self.resize(640 + PANEL_W, 480)
+        self.resize(640 + PANEL_W, 600)
         self.setMinimumSize(480, 320)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
@@ -100,6 +109,13 @@ class DebugView(QWidget):
         p.drawEllipse(QPointF(rect.x() + ax * rect.width(), rect.y() + ay * rect.height()), 9, 9)
         for i in ANCHOR_IDS:
             p.drawEllipse(pts[i], 6, 6)
+        g = r.gesture
+        if g is not None and g.toggle_progress > 0:
+            # วงความคืบหน้าการค้างท่าแบมือ (toggle)
+            c = QPointF(rect.x() + ax * rect.width(), rect.y() + ay * rect.height())
+            p.setPen(QPen(YELLOW, 4))
+            p.drawArc(QRectF(c.x() - 22, c.y() - 22, 44, 44), 90 * 16,
+                      -int(360 * 16 * g.toggle_progress))
 
     def _draw_panel(self, p: QPainter, r, rect: QRectF) -> None:
         x, y = rect.x() + 16, 24.0
@@ -119,6 +135,12 @@ class DebugView(QWidget):
         fps_color = GREEN if r.infer_fps >= 25 else (YELLOW if r.infer_fps >= 15 else RED)
         text(f"FPS  infer {r.infer_fps:5.1f}   cam {r.camera_fps:5.1f}", fps_color)
         text(f"inference {r.infer_ms:5.1f} ms", MUTED)
+        g = r.gesture
+        if g is not None:
+            label, color = _state_label(g)
+            text(f"สถานะ {label}", color, bold=True, size=11)
+            if r.target is not None:
+                text(f"cursor {r.target[0]:7.1f}, {r.target[1]:7.1f}  gain {r.gain:.2f}", MUTED)
         y += 6
 
         if r.hand is None:
@@ -128,6 +150,16 @@ class DebugView(QWidget):
         text(f"มือ {r.hand.handedness}  score {r.hand.score:.2f}", bold=True)
         text(f"ขนาดมือ {f.hand_size:.3f}", MUTED)
         y += 4
+
+        text("แบมือ: spread / หันฝ่ามือ", MUTED, size=9)
+        sv = f.spread / SPREAD_SCALE
+        self._bar(p, x, y - 12, bar_w, sv, GREEN if f.spread > self._g.palm_spread else YELLOW,
+                  (self._g.palm_spread / SPREAD_SCALE,), f"spread {f.spread:.2f}")
+        y += 26
+        self._bar(p, x, y - 12, bar_w, (f.palm_facing + 1) / 2,
+                  GREEN if f.palm_facing > self._g.palm_facing_min else YELLOW,
+                  ((self._g.palm_facing_min + 1) / 2,), f"facing {f.palm_facing:+.2f}")
+        y += 30
 
         text("curl  (1.0 = เหยียด)", MUTED, size=9)
         for name in FINGERS:
@@ -146,7 +178,7 @@ class DebugView(QWidget):
                   f"{pv * 100:.1f} cm")
 
     def _bar(self, p: QPainter, x: float, y: float, w: float, value: float,
-             color: QColor, marks: tuple[float, float], label: str) -> None:
+             color: QColor, marks: tuple[float, ...], label: str) -> None:
         """แถบค่า 0–1 พร้อมขีดบอก threshold กด/ปล่อย (hysteresis)"""
         h = 18
         p.setPen(Qt.PenStyle.NoPen)

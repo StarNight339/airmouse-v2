@@ -26,6 +26,8 @@ toggle_hold_ms = 1000
 switcher_hold_ms = 300
 switcher_step = 0.6       # ระยะเลื่อนต่อการ์ด (หน่วยขนาดมือ)
 min_presence = 0.6
+palm_spread = 0.9         # ท่าแบมือ: นิ้วต้องกางเกินค่านี้ (ดูค่า spread ใน --debug-view)
+palm_facing_min = 0.3     # ท่าแบมือ: ฝ่ามือต้องหันหากล้อง (-1..1)
 
 [app]
 auto_exit_minutes = 10
