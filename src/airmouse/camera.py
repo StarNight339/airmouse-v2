@@ -37,16 +37,38 @@ class Camera(threading.Thread):
 
     def _open(self) -> cv2.VideoCapture:
         # บน Windows ใช้ DirectShow เพราะ MSMF มักเปิดกล้องช้าหลายวินาที
+        # (ไม่ขอ MJPG: กล้องเครื่องนี้ไม่สนใจคำขอ แต่ทำให้เปิดช้าขึ้น ~0.7 วิ)
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
         cap = cv2.VideoCapture(self._cfg.index, backend)
-        if not cap.isOpened():
+        try:
+            if not cap.isOpened():
+                raise CameraError(f"เปิดกล้อง index {self._cfg.index} ไม่ได้")
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._cfg.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._cfg.height)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+            log.info(
+                "กล้องตกลงได้ %dx%d @ %.0f fps รูปแบบ %s",
+                cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
+                cap.get(cv2.CAP_PROP_FPS),
+                "".join(chr((fourcc >> 8 * i) & 0xFF) for i in range(4)).strip("\x00 ") or "?",
+            )
+        except BaseException:
             cap.release()
-            raise CameraError(f"เปิดกล้อง index {self._cfg.index} ไม่ได้")
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._cfg.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._cfg.height)
-        cap.set(cv2.CAP_PROP_FPS, 30)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            raise
         return cap
+
+    def _publish(self, frame: np.ndarray, ts: float) -> None:
+        with self._cond:
+            if self._seq == 0:
+                self.size = (frame.shape[1], frame.shape[0])
+                log.info("กล้องพร้อม %dx%d", *self.size)
+                self._opened.set()
+            self._frame, self._ts = frame, ts
+            self._seq += 1
+            self._cond.notify_all()
+        self.fps.tick(ts)
 
     def run(self) -> None:
         cap = None
@@ -65,15 +87,7 @@ class Camera(threading.Thread):
                 if not ok:
                     continue
                 failures = 0
-                with self._cond:
-                    if self._seq == 0:
-                        self.size = (frame.shape[1], frame.shape[0])
-                        log.info("กล้องพร้อม %dx%d", *self.size)
-                        self._opened.set()
-                    self._frame, self._ts = frame, ts
-                    self._seq += 1
-                    self._cond.notify_all()
-                self.fps.tick(ts)
+                self._publish(frame, ts)
         except Exception as exc:
             log.exception("camera thread error")
             self.error = str(exc)
