@@ -1,0 +1,33 @@
+[camera]
+index = 0
+width = 640
+height = 480
+mirror = true
+hand = "right"            # "right" | "left"
+
+[motion]
+mode = "relative"         # "relative" | "absolute"
+sensitivity = 1.0
+deadzone = 0.004          # หน่วย: สัดส่วนขนาดมือ
+accel_low_gain = 0.4
+accel_high_gain = 2.5
+edge_overshoot = 0.05
+click_rollback_ms = 150
+min_cutoff = 1.0
+beta = 0.007
+
+[gesture]
+curl_down = 0.60
+curl_up = 0.80
+pinch_down = 0.035        # meters
+pinch_up = 0.055
+confirm_frames = 2
+toggle_hold_ms = 1000
+switcher_hold_ms = 300
+switcher_step = 0.6       # ระยะเลื่อนต่อการ์ด (หน่วยขนาดมือ)
+min_presence = 0.6
+
+[app]
+auto_exit_minutes = 10
+low_power_after_s = 3
+sounds = true
