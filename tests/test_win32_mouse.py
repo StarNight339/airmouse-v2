@@ -285,3 +285,131 @@ def test_send_failure_log_is_rate_limited(monkeypatch, caplog):
             assert m._send(m.MOUSEEVENTF_MOVE) is False
     assert len(caplog.records) == 1
     assert math.isfinite(t[0])
+
+
+# ---- คิวคำสั่ง: click / drag / scroll ----
+@pytest.fixture
+def qrig(rig, monkeypatch):
+    th, st = rig
+    events = []
+    st["events"] = events
+    monkeypatch.setattr(m, "_pressed", set())
+
+    def fake_move(x, y, rect=None):
+        events.append(("move", x, y))
+        return True
+
+    def fake_send(flags, dx=0, dy=0, data=0):
+        events.append(("send", flags, data))
+        return True
+
+    monkeypatch.setattr(m, "move_abs", fake_move)
+    monkeypatch.setattr(m, "_send", fake_send)
+    return th, st, events
+
+
+def test_click_at_order_and_no_user_moved(qrig):
+    th, st, ev = qrig
+    th.set_active(True)
+    th.click_at(300.4, 200.6, "left")
+    th._tick(_now())
+    assert ev == [("move", 300, 201), ("send", m.MOUSEEVENTF_LEFTDOWN, 0),
+                  ("send", m.MOUSEEVENTF_LEFTUP, 0)]
+    assert not th.user_moved
+    assert th._last_sent == (300, 201)
+    th._tick(_now())  # target = จุดคลิกแล้ว ไม่ส่ง move ซ้ำ
+    assert len(ev) == 3
+
+
+def test_inactive_drops_click_scroll_down_but_runs_up(qrig):
+    th, st, ev = qrig
+    th.set_active(True)
+    th.button_down("right")  # กดค้างไว้ตอน active
+    th._tick(_now())
+    th.set_active(False)
+    ev.clear()
+    th.click_at(10, 10)
+    th.scroll(120)
+    th.button_down("left")
+    th.button_up("right")
+    th._tick(_now())
+    assert ev == [("send", m.MOUSEEVENTF_RIGHTUP, 0)]
+    assert th.held_buttons == frozenset()
+
+
+def test_drag_hold_and_user_moved_releases(qrig):
+    th, st, ev = qrig
+    th.set_active(True)
+    th.button_down("left")
+    th._tick(_now())
+    assert th.held_buttons == frozenset({"left"})
+    th._on_user_input()
+    th._tick(_now())
+    assert ("send", m.MOUSEEVENTF_LEFTUP, 0) in ev
+    assert th.held_buttons == frozenset()
+
+
+def test_pending_up_runs_even_when_user_moved(qrig):
+    th, st, ev = qrig
+    th.set_active(True)
+    th.button_down("left")
+    th._tick(_now())
+    th._on_user_input()
+    th.button_up("left")
+    th.button_down("left")  # ถูกทิ้ง
+    th._tick(_now())
+    ups = [e for e in ev if e == ("send", m.MOUSEEVENTF_LEFTUP, 0)]
+    assert ups == [("send", m.MOUSEEVENTF_LEFTUP, 0)]  # ปล่อยครั้งเดียว ไม่ซ้ำ
+    assert th.held_buttons == frozenset()
+
+
+def test_up_for_button_not_held_sends_nothing(qrig):
+    # up ซ้ำอาจไปยกเลิกปุ่มที่ผู้ใช้กดเมาส์จริงอยู่ (เช่นตอนผู้ใช้เข้ามาควบคุมแทน)
+    th, st, ev = qrig
+    th.set_active(True)
+    th.button_up("left")
+    th._tick(_now())
+    assert ev == []
+
+
+def test_drain_on_exit_sends_pending_up_and_releases(qrig):
+    th, st, ev = qrig
+    th.set_active(True)
+    th.button_down("left")
+    th._tick(_now())
+    ev.clear()
+    th.click_at(5, 5)  # ถูกทิ้งตอน drain
+    th.button_up("left")
+    th._drain_on_exit()
+    assert ev == [("send", m.MOUSEEVENTF_LEFTUP, 0)]
+    assert th.held_buttons == frozenset()
+
+
+def test_scroll_zero_skipped_and_nonzero_sent(qrig):
+    th, st, ev = qrig
+    th.set_active(True)
+    th.scroll(0)
+    th.scroll(-120)
+    th._tick(_now())
+    assert ev == [("send", m.MOUSEEVENTF_WHEEL, -120)]
+
+
+def test_bad_button_rejected(qrig):
+    th, _, _ = qrig
+    with pytest.raises(ValueError):
+        th.button_down("side")
+
+
+def test_double_click_metrics_fallback(monkeypatch):
+    class Bad:
+        @staticmethod
+        def GetDoubleClickTime():
+            raise OSError("nope")
+
+    monkeypatch.setattr(m, "_user32", Bad)
+    assert m.double_click_metrics() == (500, 4, 4)
+
+
+def test_double_click_metrics_real_sane():
+    t, w, h = m.double_click_metrics()
+    assert t > 0 and w > 0 and h > 0

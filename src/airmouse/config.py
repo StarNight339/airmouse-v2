@@ -37,6 +37,7 @@ class MotionConfig:
     click_rollback_ms: int = 150
     min_cutoff: float = 1.0
     beta: float = 0.007
+    scroll_speed: float = 600.0
 
 
 @dataclass

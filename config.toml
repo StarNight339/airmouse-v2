@@ -15,6 +15,7 @@ edge_overshoot = 0.05
 click_rollback_ms = 150
 min_cutoff = 1.0
 beta = 0.007
+scroll_speed = 600.0      # หน่วย wheel ต่อการขยับ 1 ขนาดมือ (120 = 1 notch)
 
 [gesture]
 curl_down = 0.60

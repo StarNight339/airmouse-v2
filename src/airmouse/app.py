@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 CAMERA_OPEN_TIMEOUT_S = 10.0
 DEFAULT_DT = 1 / 30
 USER_GRACE_S = 0.4  # หลังผู้ใช้ขยับเมาส์จริง รอเท่านี้ก่อนให้มือควบคุมต่อ
+DRAG_SMOOTH_S = 0.15  # ช่วงเพิ่ม smoothing ตอนเริ่มลาก กันของที่ลากเด้ง
+DOUBLE_CLICK_SNAP_PX = 16
 
 
 @dataclass(frozen=True)
@@ -51,16 +53,46 @@ class Controller:
     """ท่ามือ → motion → mouse thread (อยู่ใน inference thread)
 
     mouse ใช้ duck typing (MouseThread หรือของปลอมในเทสต์): set_target, set_active,
-    resync, user_moved
+    resync, user_moved, click_at, button_down, button_up, scroll
     """
 
-    def __init__(self, gestures: GestureTracker, motion: Motion, mouse):
+    def __init__(self, gestures: GestureTracker, motion: Motion, mouse,
+                 click_rollback_s: float = 0.15,
+                 double_click: tuple[int, int, int] = (500, 4, 4)):
         self.gestures = gestures
         self.motion = motion
         self.mouse = mouse
+        self._rollback_s = click_rollback_s
+        self._dc_s = double_click[0] / 1000
+        # รัศมีที่ถือว่าเป็นดับเบิลคลิก: มือสั่นระหว่างสองคลิกเกินค่า Windows (4 px) ได้ง่าย
+        self._dc_dx = max(double_click[1], DOUBLE_CLICK_SNAP_PX)
+        self._dc_dy = max(double_click[2], DOUBLE_CLICK_SNAP_PX)
         self._was_active = False
+        self._need_reset = False
+        self._dragging = False  # เรากดปุ่มซ้ายค้างอยู่ (ลาก)
+        self._last_click: tuple[str, float, tuple[float, float]] | None = None
         self._last_ts: float | None = None
         self._user_ts = float("-inf")  # เวลาล่าสุดที่เห็นผู้ใช้ใช้เมาส์/ทัชแพดจริง
+
+    def _release_drag(self) -> None:
+        if self._dragging:
+            self.mouse.button_up("left")
+            self._dragging = False
+            log.info("ปล่อยการลาก")
+
+    def _click(self, btn: str, bend_ts: float | None, ts: float) -> None:
+        # ย้อนไปตำแหน่งก่อนเริ่มพับนิ้ว (การพับนิ้วทำให้มือขยับเล็กน้อย)
+        t = ts - self._rollback_s if bend_ts is None else max(bend_ts, ts - self._rollback_s)
+        pos = self.motion.history_at(t)
+        last = self._last_click
+        if (last is not None and last[0] == btn and ts - last[1] <= self._dc_s
+                and abs(pos[0] - last[2][0]) <= self._dc_dx
+                and abs(pos[1] - last[2][1]) <= self._dc_dy):
+            pos = last[2]  # จุดเดียวกับครั้งก่อน → Windows นับเป็นดับเบิลคลิก
+        self.mouse.click_at(pos[0], pos[1], btn)
+        self.motion.set_position(pos)
+        self._last_click = (btn, ts, pos)
+        log.info("คลิก%s ที่ (%.0f, %.0f)", "ซ้าย" if btn == "left" else "ขวา", *pos)
 
     def step(self, feats: HandFeatures | None, ts: float, aspect: float
              ) -> tuple[GestureState, tuple[float, float] | None]:
@@ -77,15 +109,41 @@ class Controller:
         # ผู้ใช้เพิ่งใช้เมาส์จริง: พักการควบคุมด้วยมือสักครู่ ไม่แย่งกัน
         user_busy = ts - self._user_ts < USER_GRACE_S
         active = feats is not None and g.enabled and not g.clutch and not user_busy
+        events = set(g.events)
         target = None
+        if not active or "drag_end" in events:
+            # มือหาย, ปิดการควบคุม, ผู้ใช้จับเมาส์ หรือปล่อยจีบ → ห้ามมีปุ่มค้าง
+            self._release_drag()
         if active:
-            # เริ่มควบคุมใหม่ (toggle, ปล่อย clutch, มือกลับมา, ผู้ใช้เลิกใช้เมาส์)
-            # → ตั้งต้นจากตำแหน่ง cursor ปัจจุบัน ไม่ให้กระโดด
-            if not self._was_active:
-                self.motion.reset(self.mouse.resync())
-            target = self.motion.update(feats.anchor, feats.hand_size, aspect, dt)
-            self.mouse.set_target(target[0], target[1], dt)
-        self.mouse.set_active(active)
+            # ตั้ง active ก่อนใส่คำสั่ง ไม่งั้น mouse thread อาจทิ้งคลิกของเฟรมแรกที่ active
+            self.mouse.set_active(True)
+            if "scroll_start" in events:
+                self.motion.reset_scroll()
+            if g.mode == "scroll":
+                # scroll: cursor อยู่กับที่ ขยับมือขึ้นลงเป็น wheel
+                delta = self.motion.scroll_delta(feats.anchor[1], feats.hand_size, dt)
+                if delta:
+                    self.mouse.scroll(delta)
+                self._need_reset = True
+            else:
+                # เริ่มควบคุมใหม่ (toggle, ปล่อย clutch, มือกลับมา, ผู้ใช้เลิกใช้เมาส์,
+                # จบ scroll) → ตั้งต้นจากตำแหน่ง cursor ปัจจุบัน ไม่ให้กระโดด
+                if not self._was_active or self._need_reset:
+                    self.motion.reset(self.mouse.resync())
+                    self._need_reset = False
+                target = self.motion.update(feats.anchor, feats.hand_size, aspect, dt, ts=ts)
+                self.mouse.set_target(target[0], target[1], dt)
+                if "drag_start" in events and not self._dragging:
+                    self.motion.boost_smoothing(DRAG_SMOOTH_S)
+                    self.mouse.button_down("left")
+                    self._dragging = True
+                    log.info("เริ่มลาก")
+                if "click_left" in events:
+                    self._click("left", g.click_bend_ts, ts)
+                if "click_right" in events:
+                    self._click("right", g.click_bend_ts, ts)
+        if not active:
+            self.mouse.set_active(False)  # หลังใส่ button_up แล้ว (up รันเสมอแม้ inactive)
         self._was_active = active
         return g, target
 
@@ -180,7 +238,7 @@ class _DebugStats:
                 mouse = " | mouse dt avg=%.1f max=%.1f ms late=%d" % (
                     ms["dt_avg_ms"], ms["dt_max_ms"], ms["late"])
             g = r.gesture
-            state = "-" if g is None else ("off" if not g.enabled else ("clutch" if g.clutch else "on"))
+            state = "-" if g is None else g.mode
             log.debug(
                 "fps cam=%.1f infer=%.1f | dt avg=%.1f max=%.1f ms | infer avg=%.1f max=%.1f ms"
                 " | hand=%s state=%s%s",
@@ -239,7 +297,9 @@ def run(args: argparse.Namespace) -> int:
         mouse.start()
         screen = win_mouse.virtual_screen()
         motion = Motion(cfg.motion, screen, px_per_hand=win_mouse.primary_screen().h)
-        controller = Controller(GestureTracker(cfg.gesture), motion, mouse)
+        controller = Controller(GestureTracker(cfg.gesture), motion, mouse,
+                                click_rollback_s=cfg.motion.click_rollback_ms / 1000,
+                                double_click=win_mouse.double_click_metrics())
         log.info("จอ (virtual desktop) %s | แบมือค้าง %d ms เพื่อเปิดการควบคุม",
                  screen, cfg.gesture.toggle_hold_ms)
 

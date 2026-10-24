@@ -18,6 +18,15 @@ HAND_CONNECTIONS = (
 PANEL_W = 280
 PINCH_SCALE_M = 0.12  # ความยาวแถบ pinch เต็มหลอด
 SPREAD_SCALE = 2.0    # ความยาวแถบ spread เต็มหลอด
+FLASH_S = 0.6         # ไฮไลต์ event นานเท่านี้
+FLASH_EVENTS = {
+    "click_left": "● คลิกซ้าย",
+    "click_right": "● คลิกขวา",
+    "drag_start": "▼ เริ่มลาก",
+    "drag_end": "▲ ปล่อยลาก",
+    "scroll_start": "↕ เริ่ม scroll",
+    "scroll_end": "↕ จบ scroll",
+}
 
 BG = QColor(24, 24, 28)
 TEXT = QColor(230, 230, 235)
@@ -30,12 +39,18 @@ JOINT = QColor(0, 200, 255)
 ANCHOR = QColor(80, 255, 80)
 
 
+_MODE_LABELS = {
+    "move": ("MOVE", GREEN),
+    "clutch": ("CLUTCH", YELLOW),
+    "drag": ("DRAG (กดค้าง)", RED),
+    "scroll": ("SCROLL", JOINT),
+}
+
+
 def _state_label(g) -> tuple[str, QColor]:
     if not g.enabled:
         return "OFF (แบมือค้างเพื่อเปิด)", MUTED
-    if g.clutch:
-        return "CLUTCH", YELLOW
-    return "ON", GREEN
+    return _MODE_LABELS.get(g.mode, ("ON", GREEN))
 
 
 class DebugView(QWidget):
@@ -44,6 +59,7 @@ class DebugView(QWidget):
         self._inference = inference
         self._g = gesture
         self._result = None
+        self._flash: tuple[str, float] | None = None  # (ข้อความ event, เวลา) ไว้ไฮไลต์ชั่วครู่
         self.setWindowTitle("Air Mouse — debug view (Esc เพื่อออก)")
         self.resize(640 + PANEL_W, 600)
         self.setMinimumSize(480, 320)
@@ -55,6 +71,9 @@ class DebugView(QWidget):
         r = self._inference.latest()
         if r is not None and (self._result is None or r.seq != self._result.seq):
             self._result = r
+            shown = [e for e in (r.gesture.events if r.gesture else ()) if e in FLASH_EVENTS]
+            if shown:
+                self._flash = (FLASH_EVENTS[shown[-1]], r.ts)
             self.update()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
@@ -139,6 +158,10 @@ class DebugView(QWidget):
         if g is not None:
             label, color = _state_label(g)
             text(f"สถานะ {label}", color, bold=True, size=11)
+            if self._flash is not None and r.ts - self._flash[1] < FLASH_S:
+                text(self._flash[0], YELLOW, bold=True, size=11)
+            else:
+                y += 22
             if r.target is not None:
                 text(f"cursor {r.target[0]:7.1f}, {r.target[1]:7.1f}  gain {r.gain:.2f}", MUTED)
         y += 6

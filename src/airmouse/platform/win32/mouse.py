@@ -24,6 +24,8 @@ SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
+SM_CXDOUBLECLK = 36
+SM_CYDOUBLECLK = 37
 
 INPUT_MOUSE = 0
 MOUSEEVENTF_MOVE = 0x0001
@@ -202,6 +204,8 @@ _user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 _user32.GetSystemMetrics.restype = ctypes.c_int
 _user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 _user32.GetCursorPos.restype = wintypes.BOOL
+_user32.GetDoubleClickTime.argtypes = []
+_user32.GetDoubleClickTime.restype = wintypes.UINT
 _user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
 _user32.RegisterClassW.restype = wintypes.ATOM
 _user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE]
@@ -356,6 +360,19 @@ def scroll(delta: int) -> bool:
     return _send(MOUSEEVENTF_WHEEL, data=int(delta))
 
 
+def double_click_metrics() -> tuple[int, int, int]:
+    """(เวลา ms, ความกว้าง px, ความสูง px) ของ double-click ของระบบ; fallback (500, 4, 4)"""
+    try:
+        t = int(_user32.GetDoubleClickTime())
+        w = int(_user32.GetSystemMetrics(SM_CXDOUBLECLK))
+        h = int(_user32.GetSystemMetrics(SM_CYDOUBLECLK))
+        if t > 0 and w > 0 and h > 0:
+            return t, w, h
+    except Exception:  # noqa: BLE001
+        log.debug("อ่านค่า double-click ไม่ได้ ใช้ค่าเริ่มต้น", exc_info=True)
+    return 500, 4, 4
+
+
 def release_all() -> None:
     """ปล่อยเฉพาะปุ่มที่ module นี้กดค้างไว้"""
     with _pressed_lock:
@@ -504,6 +521,8 @@ class MouseThread(threading.Thread):
         self._last_sent: tuple[int, int] | None = p  # ไม่ส่งซ้ำจนกว่า target จะเปลี่ยน
         self._gen = 0  # เพิ่มทุกครั้งที่ resync เพื่อทิ้งผลส่งที่ค้างมาจากก่อน resync
         self._backoff_until = 0.0
+        self._cmds: collections.deque[tuple] = collections.deque()
+        self._held: set[str] = set()
         # fallback เมื่อ Raw Input ใช้ไม่ได้
         self._fallback = False
         self._recent: collections.deque[tuple[int, int]] = collections.deque(maxlen=3)
@@ -609,6 +628,107 @@ class MouseThread(threading.Thread):
             self._dev_ticks = self._dev_ticks + 1 if dev > USER_MOVE_THRESHOLD_PX else 0
             return self._dev_ticks >= USER_MOVE_PERSIST_TICKS
 
+    # ---- คิวคำสั่ง (ปุ่ม/scroll/click) : รันบน mouse thread เรียงลำดับเดียวกับการขยับ ----
+    def click_at(self, x: float, y: float, btn: str = "left") -> None:
+        """กระโดดไป (x, y) ทันที (ไม่ interpolate) แล้ว down+up"""
+        self._enqueue(("click", float(x), float(y), self._check_btn(btn)))
+
+    def button_down(self, btn: str) -> None:
+        self._enqueue(("down", self._check_btn(btn)))
+
+    def button_up(self, btn: str) -> None:
+        self._enqueue(("up", self._check_btn(btn)))
+
+    def scroll(self, delta: int) -> None:
+        """delta หน่วยดิบของล้อ (120 = หนึ่งรอยบาก, บวก = ขึ้น); 0 ถูกข้าม"""
+        if int(delta) != 0:
+            self._enqueue(("scroll", int(delta)))
+
+    @property
+    def held_buttons(self) -> frozenset[str]:
+        """ปุ่มที่ thread นี้กดค้างอยู่ (เช่นระหว่าง drag)"""
+        with self._lock:
+            return frozenset(self._held)
+
+    @staticmethod
+    def _check_btn(btn: str) -> str:
+        if btn not in _BUTTON_FLAGS:
+            raise ValueError(f"unknown button {btn!r}")
+        return btn
+
+    def _enqueue(self, cmd: tuple) -> None:
+        with self._lock:
+            self._cmds.append(cmd)
+
+    def _exec_up(self, btn: str) -> None:
+        # ปล่อยเฉพาะปุ่มที่เรากดค้างอยู่จริง: up ซ้ำอาจไปยกเลิกปุ่มที่ผู้ใช้กดเมาส์จริงอยู่
+        with self._lock:
+            held = btn in self._held
+        with _pressed_lock:
+            held = held or btn in _pressed
+        if not held:
+            return
+        if button_up(btn):
+            with self._lock:
+                self._held.discard(btn)
+
+    def _run_commands(self) -> None:
+        """รันคิวก่อน interpolation ของทุก tick กติกา: button_up รันเสมอ (ห้ามทิ้ง ไม่งั้นปุ่มค้าง)
+        ส่วน down/click_at/scroll จะถูกทิ้ง (log debug) ถ้า inactive หรือ user_moved ตอนรัน
+        และถ้า user_moved ขณะเรากดปุ่มค้างอยู่ จะปล่อยปุ่มทันที (ผู้ใช้เข้ามาควบคุมแล้ว)"""
+        with self._lock:
+            cmds = list(self._cmds)
+            self._cmds.clear()
+        for cmd in cmds:
+            kind = cmd[0]
+            if kind == "up":
+                self._exec_up(cmd[1])
+                continue
+            with self._lock:
+                allowed = self._active and not self._user_moved
+                rect = self._rect
+            if not allowed:
+                log.debug("ทิ้งคำสั่ง %s (inactive/user_moved)", kind)
+                continue
+            if kind == "down":
+                if button_down(cmd[1]):
+                    with self._lock:
+                        self._held.add(cmd[1])
+            elif kind == "scroll":
+                scroll(cmd[1])
+            elif kind == "click":
+                _, x, y, btn = cmd
+                r = (round(x), round(y))
+                with self._lock:
+                    self._seg_start = self._seg_target = (x, y)
+                    self._seg_dur = 0.0
+                    self._seg_t0 = time.perf_counter()
+                    gen = self._gen
+                if not move_abs(r[0], r[1], rect):
+                    log.debug("click_at: ย้ายไม่สำเร็จ ข้ามการคลิก")
+                    continue
+                with self._lock:
+                    if self._gen == gen:
+                        self._last_sent = r
+                        self._recent.append(r)
+                if button_down(btn):
+                    button_up(btn)
+        with self._lock:
+            held = list(self._held) if self._user_moved else []
+        for b in held:
+            self._exec_up(b)
+
+    def _drain_on_exit(self) -> None:
+        """ตอนปิด thread: รันเฉพาะ button_up ที่ค้างในคิว แล้ว release_all"""
+        with self._lock:
+            ups = [c for c in self._cmds if c[0] == "up"]
+            self._cmds.clear()
+        for c in ups:
+            self._exec_up(c[1])
+        release_all()
+        with self._lock:
+            self._held.clear()
+
     def _tick(self, now: float) -> None:
         if now >= self._next_screen_check:
             self._next_screen_check = now + SCREEN_REFRESH_S
@@ -616,6 +736,7 @@ class MouseThread(threading.Thread):
             if new.w > 0 and new.h > 0:
                 with self._lock:
                     self._rect = new
+        self._run_commands()
         # คำนวณใน lock แล้วปล่อยก่อนทำ syscall (SendInput/GetCursorPos)
         with self._lock:
             if not self._active or self._user_moved or now < self._backoff_until:
@@ -670,4 +791,4 @@ class MouseThread(threading.Thread):
                     _tick_err_log.warning("mouse tick ผิดพลาด", exc_info=True)
         finally:
             raw.stop()
-            release_all()
+            self._drain_on_exit()

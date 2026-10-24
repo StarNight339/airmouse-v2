@@ -242,3 +242,160 @@ def test_slow_and_fast_motion_get_different_gain():
 
     assert run(0.004) == pytest.approx(0.4, abs=0.03)
     assert run(0.04) == pytest.approx(2.5)
+
+
+# ===================== Phase 3: history / set_position / boost / scroll =====================
+def _moving(m: Motion, n: int, fps: int = 30, step: float = 0.01, x: float = 0.1, t0: float = 0.0):
+    """ขยับมือไปทางขวา n เฟรม พร้อม ts; คืน (x, ts, [(ts, out)])"""
+    out_log = []
+    ts = t0
+    for _ in range(n):
+        ts += 1 / fps
+        x += step
+        out = m.update((x, 0.5), SIZE, ASPECT, 1 / fps, ts=ts)
+        out_log.append((ts, out))
+    return x, ts, out_log
+
+
+def test_history_at_returns_past_positions():
+    m = _motion()
+    m.update((0.1, 0.5), SIZE, ASPECT, DT, ts=0.0)
+    _, _, log = _moving(m, 20)
+    ts_last, out_last = log[-1]
+    assert m.history_at(ts_last) == out_last
+    assert m.history_at(ts_last + 5) == out_last          # อนาคต → ล่าสุด
+    ts_mid, out_mid = log[10]
+    assert m.history_at(ts_mid) == out_mid
+    assert m.history_at(ts_mid + 0.5 * DT) == out_mid     # ระหว่างเฟรม → ตัวก่อนหน้า
+    assert m.history_at(-10.0) == m._hist[0][1:]          # เก่ากว่า buffer → เก่าสุด
+    assert out_mid[0] < out_last[0]
+
+
+def test_history_is_trimmed_by_time():
+    m = _motion()
+    m.update((0.1, 0.5), SIZE, ASPECT, DT, ts=0.0)
+    _moving(m, 60)  # 2 s
+    assert m._hist[-1][0] - m._hist[0][0] <= 0.3 + 1e-9
+    assert len(m._hist) <= 12
+
+
+def test_history_empty_returns_current_position():
+    m = _motion()
+    assert m.history_at(1.0) == (5000.0, 5000.0)
+    m.update((0.1, 0.5), SIZE, ASPECT, DT)  # ไม่ส่ง ts → ไม่บันทึก
+    assert m.history_at(1.0) == (5000.0, 5000.0)
+
+
+def test_set_position_no_jump_and_keeps_motion_state():
+    m = _motion()
+    m.update((0.1, 0.5), SIZE, ASPECT, DT, ts=0.0)
+    x, ts, log = _moving(m, 30)
+    speed, gain = m.speed, m.gain
+    m.set_position((4000.0, 4500.0))
+    assert (m.speed, m.gain) == (speed, gain)
+    assert m.history_at(ts) == (4000.0, 4500.0)
+    # เฟรมถัดไปขยับต่อจากตำแหน่งใหม่ด้วยก้าวปกติ ไม่กระโดด
+    prev_step = log[-1][1][0] - log[-2][1][0]
+    _, _, log2 = _moving(m, 1, x=x, t0=ts)
+    out = log2[0][1]
+    assert out[0] - 4000.0 == pytest.approx(prev_step, rel=0.3)
+    assert out[1] == pytest.approx(4500.0, abs=1e-6)
+    # clamp
+    m.set_position((-50.0, 1e9))
+    assert m._pos == [0.0, 9999.0]
+
+
+def test_boost_smoothing_has_no_jump_and_ends():
+    m = _motion(accel_low_gain=1.0, accel_high_gain=1.0)
+    m.update((0.1, 0.5), SIZE, ASPECT, DT, ts=0.0)
+    x, ts, _ = _moving(m, 30)
+    m.boost_smoothing(0.3)
+    steps = []
+    prev = m._pos[0]
+    for _ in range(30):  # 1 s ที่ความเร็วคงที่ ผ่านช่วง boost จนจบ
+        ts += DT
+        x += 0.01
+        out = m.update((x, 0.5), SIZE, ASPECT, DT, ts=ts)
+        steps.append(out[0] - prev)
+        prev = out[0]
+    assert m._boost_left == 0.0
+    assert all(s >= 0 for s in steps)
+    # ไม่มีก้าวกระโดดเกิน ~2 เท่าของก้าวคงที่ปลายช่วง
+    steady = steps[-1]
+    assert steady > 0 and max(steps) < 2.5 * steady
+    # ขณะ boost leash ใหญ่ขึ้น → ก้าวต้นช่วงไม่มากกว่าปกติ
+    assert steps[0] <= steady * 1.2
+
+
+def test_boost_smoothing_suppresses_small_motion_more():
+    def wander(boost: bool) -> float:
+        rng = random.Random(3)
+        m = _motion()
+        m.update((0.5, 0.5), SIZE, ASPECT, DT, ts=0.0)
+        if boost:
+            m.boost_smoothing(10.0)
+        xs = []
+        ts = 0.0
+        for _ in range(150):
+            ts += DT
+            xs.append(m.update((0.5 + rng.gauss(0, 0.004), 0.5 + rng.gauss(0, 0.004)),
+                               SIZE, ASPECT, DT, ts=ts)[0])
+        return max(xs) - min(xs)
+
+    assert wander(True) <= wander(False)
+
+
+def test_scroll_first_call_zero_and_direction():
+    m = _motion()
+    assert m.scroll_delta(0.5, SIZE, DT) == 0
+    y, total = 0.5, 0
+    for _ in range(30):  # มือขึ้น (y ลด) = บวก
+        y -= 0.01
+        total += m.scroll_delta(y, SIZE, DT)
+    assert total > 0
+    m.reset_scroll()
+    assert m.scroll_delta(y, SIZE, DT) == 0
+    total = 0
+    for _ in range(30):  # มือลง = ลบ
+        y += 0.01
+        total += m.scroll_delta(y, SIZE, DT)
+    assert total < 0
+
+
+def test_scroll_remainder_is_accumulated_not_lost():
+    m = _motion()
+    speed = getattr(m.cfg, "scroll_speed", 600.0)
+    m.scroll_delta(0.9, SIZE, DT)
+    y, total = 0.9, 0
+    n = 120
+    step = 0.0007  # ช้า: ต่อเฟรมได้ไม่ถึง 1 wheel unit หลังหัก deadzone
+    for _ in range(n):
+        y -= step
+        total += m.scroll_delta(y, SIZE, DT)
+    # ผลรวมเข้าใกล้ (ระยะทั้งหมด − deadzone − lag ของ filter) × speed / size ภายใน 1-2 unit
+    assert isinstance(total, int)
+    moved = n * step
+    ideal = (moved / SIZE) * speed
+    assert 0 < total <= ideal
+    assert total >= ideal - speed * (0.03 + 0.2 * step * 30 / SIZE) - 2  # หัก leash + lag
+
+
+def test_scroll_ignores_jitter():
+    rng = random.Random(7)
+    m = _motion()
+    m.scroll_delta(0.5, SIZE, DT)
+    total = 0
+    for _ in range(300):
+        total += abs(m.scroll_delta(0.5 + rng.gauss(0, 0.002), SIZE, DT))
+    assert total == 0
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_scroll_works_at_low_fps(fps):
+    m = _motion()
+    m.scroll_delta(0.8, SIZE, 1 / fps)
+    y, total = 0.8, 0
+    for _ in range(fps):  # ขยับ 0.3 ภาพใน 1 s
+        y -= 0.3 / fps
+        total += m.scroll_delta(y, SIZE, 1 / fps)
+    assert total > 200

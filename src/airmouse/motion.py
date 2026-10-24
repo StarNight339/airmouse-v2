@@ -6,6 +6,7 @@ pipeline: pre-filter (One Euro เบา ๆ) → leash deadzone (รัศม�
 from __future__ import annotations
 
 import logging
+from collections import deque
 from typing import Protocol
 
 from .config import MotionConfig
@@ -30,6 +31,13 @@ SPEED_ALPHA = 0.4     # EMA ของความเร็ว
 # เพิ่ม (มือเร็ว ~0.5 ภาพ/s → +~3 Hz) lag จึงน้อย
 PRE_MIN_CUTOFF = 1.5
 PRE_BETA = 6.0
+
+
+HISTORY_S = 0.3          # เก็บตำแหน่ง output ย้อนหลังเท่านี้ (ใช้ย้อนตำแหน่งคลิก)
+BOOST_LEASH = 1.5        # boost_smoothing: คูณรัศมี leash ตอนเริ่ม แล้วลดเชิงเส้นกลับเป็น 1
+BOOST_CUTOFF = 0.5       # boost_smoothing: คูณ min_cutoff ของ pre-filter ตอนเริ่ม
+SCROLL_LEASH = 0.03      # รัศมี deadzone ของ scroll (hand-size) กัน jitter
+SCROLL_CUTOFF = 3.0      # pre-filter ของ scroll (Hz) เบากว่าของ cursor เพราะมือเคลื่อนช้า/จงใจ
 
 
 class Bounds(Protocol):
@@ -62,6 +70,12 @@ class Motion:
         self._warned = False
         self._fx = OneEuroFilter(PRE_MIN_CUTOFF, PRE_BETA)
         self._fy = OneEuroFilter(PRE_MIN_CUTOFF, PRE_BETA)
+        self._hist: deque[tuple[float, float, float]] = deque()
+        self._last_ts: float | None = None
+        self._boost_total = 0.0
+        self._boost_left = 0.0
+        self._sf = OneEuroFilter(SCROLL_CUTOFF, 0.0)
+        self.reset_scroll()
         self.reset((bounds.x, bounds.y))
 
     def reset(self, cursor_xy: tuple[float, float]) -> None:
@@ -73,9 +87,83 @@ class Motion:
         self._fy.reset()
         self.speed = 0.0
         self.gain = self.cfg.accel_low_gain
+        self._hist.clear()
+        self._last_ts = None
+        self._boost_total = self._boost_left = 0.0
+        self._fx.min_cutoff = PRE_MIN_CUTOFF
+        self._fy.min_cutoff = PRE_MIN_CUTOFF
+
+    # ---- ประวัติตำแหน่ง / ตั้งตำแหน่ง / boost ----
+    def _record(self, ts: float | None) -> None:
+        if ts is None:
+            return
+        self._last_ts = ts
+        self._hist.append((ts, self._pos[0], self._pos[1]))
+        while self._hist and ts - self._hist[0][0] > HISTORY_S:
+            self._hist.popleft()
+
+    def history_at(self, t: float) -> tuple[float, float]:
+        """ตำแหน่ง output ล่าสุดที่ ts <= t; ถ้า t เก่ากว่า buffer คืนตัวเก่าสุด; ว่างคืนตำแหน่งปัจจุบัน"""
+        if not self._hist:
+            return (self._pos[0], self._pos[1])
+        best = self._hist[0]
+        for sample in self._hist:
+            if sample[0] <= t:
+                best = sample
+            else:
+                break
+        return (best[1], best[2])
+
+    def set_position(self, xy: tuple[float, float]) -> None:
+        """ย้ายตำแหน่งสะสมโดยไม่แตะ leash/filter/speed (ใช้หลังคลิกย้อนตำแหน่ง)"""
+        b = self.bounds
+        self._pos[0] = _clamp(float(xy[0]), b.x, b.x + b.w - 1)
+        self._pos[1] = _clamp(float(xy[1]), b.y, b.y + b.h - 1)
+        if self._hist:  # แก้ตัวล่าสุดให้ตรงกับตำแหน่งใหม่ ไม่ให้ history_at ย้อนกลับไปค่าเก่า
+            ts = self._hist[-1][0]
+            self._hist[-1] = (ts, self._pos[0], self._pos[1])
+
+    def boost_smoothing(self, seconds: float) -> None:
+        """เพิ่ม smoothing ชั่วคราว (เริ่มลาก): leash ×BOOST_LEASH และ cutoff ×BOOST_CUTOFF
+        แล้วค่อยลดเชิงเส้นกลับเป็นปกติตาม dt สะสม; เปลี่ยนแบบต่อเนื่อง ไม่มีก้าวกระโดดตอนจบ"""
+        self._boost_total = self._boost_left = max(0.0, seconds)
+
+    def _boost(self) -> float:
+        return self._boost_left / self._boost_total if self._boost_total > 0 else 0.0
+
+    # ---- scroll ----
+    def reset_scroll(self) -> None:
+        self._sf.reset()
+        self._s_ref: float | None = None
+        self._s_acc = 0.0
+
+    def scroll_delta(self, anchor_y: float, hand_size: float, dt: float) -> int:
+        """ขยับมือขึ้น (anchor_y ลด) = บวก; เศษของ wheel สะสมไว้ ไม่ทิ้ง"""
+        dt_c = min(DT_MAX, max(DT_MIN, dt))
+        y = self._sf(anchor_y, dt_c)
+        if self._s_ref is None:
+            self._s_ref = y
+            return 0
+        size = max(hand_size, 1e-6)
+        radius = SCROLL_LEASH * size
+        e = y - self._s_ref
+        if abs(e) <= radius:
+            return 0
+        step = e - radius if e > 0 else e + radius
+        self._s_ref += step
+        self._s_acc += -step / size * getattr(self.cfg, "scroll_speed", 600.0)
+        n = int(self._s_acc)  # ตัดเข้าหา 0 เศษคงไว้ใน _s_acc
+        self._s_acc -= n
+        return n
 
     def update(self, anchor: tuple[float, float], hand_size: float,
-               aspect: float, dt: float) -> tuple[float, float]:
+               aspect: float, dt: float, ts: float | None = None) -> tuple[float, float]:
+        out = self._update(anchor, hand_size, aspect, dt)
+        self._record(ts)
+        return out
+
+    def _update(self, anchor: tuple[float, float], hand_size: float,
+                aspect: float, dt: float) -> tuple[float, float]:
         cfg, b = self.cfg, self.bounds
         if cfg.mode == "absolute" and not self._warned:
             log.warning("motion.mode=absolute ยังไม่รองรับ ใช้ relative แทน")
@@ -94,6 +182,11 @@ class Motion:
         # อัปเดต dt_ema เสมอ (dt_c ถูกจำกัดไว้แล้ว) ไม่งั้นถ้า fps ตกถาวร เช่นห้องมืดลง
         # ทุกเฟรมจะถูกนับว่า "ช้า" ตลอดไป แล้ว speed/gain จะค้าง
         self._dt_ema += DT_ALPHA * (dt_c - self._dt_ema)
+        boost = self._boost()
+        if self._boost_left > 0:
+            self._boost_left = max(0.0, self._boost_left - dt_c)
+        cut = PRE_MIN_CUTOFF * (1.0 - (1.0 - BOOST_CUTOFF) * boost)
+        self._fx.min_cutoff = self._fy.min_cutoff = cut
         px = self._fx(anchor[0] * aspect, dt_c)
         py = self._fy(anchor[1], dt_c)
 
@@ -105,7 +198,7 @@ class Motion:
         rx, ry = self._ref
         ex, ey = px - rx, py - ry
         dist = (ex * ex + ey * ey) ** 0.5
-        radius = cfg.deadzone * size
+        radius = cfg.deadzone * size * (1.0 + (BOOST_LEASH - 1.0) * boost)
         mx = my = 0.0
         if dist > radius:
             f = (dist - radius) / dist

@@ -159,3 +159,249 @@ def test_hand_lost_resets_hold_and_clutch():
     assert t.clutch
     st = t.update(None, ts + 0.1)
     assert st.events == ("clutch_off",) and not st.clutch and st.enabled
+
+
+# ===================== Phase 3: click / drag / scroll =====================
+import itertools
+
+import pytest
+
+FPS = [10, 30]
+EXT = 0.95
+
+
+def _g(idx=EXT, mid=EXT, ring=EXT, pinky=EXT, pinch=0.1, spread=0.3, facing=0.9) -> HandFeatures:
+    f = _f(curls=(0.9, idx, mid, ring, pinky), spread=spread, facing=facing)
+    return HandFeatures(curl=f.curl, pinch=pinch, hand_size=f.hand_size, anchor=f.anchor,
+                        spread=f.spread, palm_facing=f.palm_facing)
+
+
+class Rig:
+    """tracker ที่ enable แล้ว + ป้อนเฟรมที่ fps ที่กำหนด เก็บ event พร้อม ts"""
+
+    def __init__(self, fps: int) -> None:
+        self.fps = fps
+        self.dt = 1 / fps
+        self.t = GestureTracker(GestureConfig())
+        self.ts = 0.0
+        self.log: list[tuple[float, str]] = []
+        self.states: list = []
+        for _ in range(int(1.2 * fps) + 2):  # ฝ่ามือค้างเกิน 1 s
+            self.feed(PALM)
+        assert [e for _, e in self.log] == ["toggle_on"]
+        self.log.clear()
+        self.feed_n(_g(), 3)  # เหยียดนิ้ว → armed
+
+    def feed(self, feats):
+        self.ts += self.dt
+        st = self.t.update(feats, self.ts)
+        self.states.append(st)
+        self.log += [(self.ts, e) for e in st.events]
+        return st
+
+    def feed_n(self, feats, n: int):
+        st = None
+        for _ in range(n):
+            st = self.feed(feats)
+        return st
+
+    def events(self) -> list[str]:
+        return [e for _, e in self.log]
+
+    def count(self, name: str) -> int:
+        return self.events().count(name)
+
+
+def _ramp(a: float, b: float, n: int) -> list[float]:
+    """n ค่าจาก a ไป b (ไม่รวม a, รวม b)"""
+    return [a + (b - a) * (i + 1) / n for i in range(n)]
+
+
+def _bend_frames(fps: int) -> int:
+    return 3 if fps <= 10 else 8  # พับนิ้วใช้ ~0.3 s
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_single_bend_gives_one_left_click_with_bend_ts(fps):
+    r = Rig(fps)
+    n = _bend_frames(fps)
+    first_below_up = None
+    for v in _ramp(EXT, 0.3, n):
+        r.feed(_g(idx=v))
+        if first_below_up is None and v < 0.8:
+            first_below_up = r.ts
+    r.feed_n(_g(idx=0.3), 2 * fps)  # ค้างพับนาน ๆ ไม่คลิกซ้ำ
+    assert r.events() == ["click_left"]
+    click_state = next(s for s in r.states if "click_left" in s.events)
+    assert click_state.click_bend_ts == pytest.approx(first_below_up)
+    assert click_state.mode == "move"
+    r.feed_n(_g(), 3)
+    assert r.count("click_left") == 1
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_two_quick_bends_give_two_clicks(fps):
+    r = Rig(fps)
+    n = _bend_frames(fps)
+    for _ in range(2):
+        for v in _ramp(EXT, 0.3, n):
+            r.feed(_g(idx=v))
+        for v in _ramp(0.3, EXT, max(1, n // 2)):
+            r.feed(_g(idx=v))
+    r.feed_n(_g(), 2)
+    assert r.count("click_left") == 2
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_pinch_gives_drag_not_click(fps):
+    r = Rig(fps)
+    r.feed_n(_g(idx=0.7, pinch=0.02), 5)
+    assert r.events() == ["drag_start"]
+    assert r.states[-1].mode == "drag" and r.states[-1].pinch_progress == 1.0
+    # ระหว่างลาก นิ้วชี้พับก็ไม่คลิก
+    r.feed_n(_g(idx=0.3, pinch=0.02), 5)
+    assert "click_left" not in r.events()
+    r.feed_n(_g(idx=EXT, pinch=0.1), 3)
+    assert r.events() == ["drag_start", "drag_end"]
+    assert r.states[-1].mode == "move"
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_pinch_hysteresis_keeps_drag(fps):
+    r = Rig(fps)
+    r.feed_n(_g(pinch=0.02), 4)
+    r.feed_n(_g(pinch=0.045), 6)  # อยู่ระหว่าง down/up
+    assert r.states[-1].mode == "drag"
+    assert r.events() == ["drag_start"]
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_left_click_needs_rearm_after_drag(fps):
+    r = Rig(fps)
+    r.feed_n(_g(pinch=0.02), 4)
+    r.feed_n(_g(idx=0.3, pinch=0.1), 6)  # ปล่อยจีบแต่ชี้ยังพับ
+    assert r.events() == ["drag_start", "drag_end"]
+    r.feed_n(_g(), 3)  # เหยียด = armed
+    r.feed_n(_g(idx=0.3), 3)
+    assert r.count("click_left") == 1
+
+
+@pytest.mark.parametrize("fps", FPS)
+@pytest.mark.parametrize("order", list(itertools.permutations(range(4))))
+def test_natural_fist_close_never_clicks(fps, order):
+    # order[i] = ลำดับที่นิ้ว i เริ่มพับ เหลื่อมกันลำดับละ 40 ms (รวม 120 ms) (กำมือธรรมชาติ)
+    r = Rig(fps)
+    n = _bend_frames(fps)
+    for step in range(n + 4):
+        curls = []
+        for finger in range(4):
+            k = step - order[finger] * 0.04 * fps  # เฟรมที่ผ่านไปนับจากเริ่มพับของนิ้วนี้
+            curls.append(EXT if k <= 0 else max(0.3, EXT - (EXT - 0.3) * k / n))
+        r.feed(_g(*curls))
+    r.feed_n(_g(0.3, 0.3, 0.3, 0.3), 4)
+    ev = r.events()
+    assert "click_left" not in ev and "click_right" not in ev
+    assert "clutch_on" in ev
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_scroll_pose_start_end_and_no_click(fps):
+    r = Rig(fps)
+    n = _bend_frames(fps)
+    for v in _ramp(EXT, 0.3, n):  # นางกับก้อยพับ โดยชี้/กลางเหยียด
+        r.feed(_g(ring=v, pinky=v))
+    r.feed_n(_g(ring=0.3, pinky=0.3), 5)
+    assert r.events() == ["scroll_start"]
+    assert r.states[-1].mode == "scroll"
+    r.feed_n(_g(), 4)
+    assert r.events() == ["scroll_start", "scroll_end"]
+    assert r.count("click_left") == 0 and r.count("click_right") == 0
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_right_click_needs_index_extended(fps):
+    r = Rig(fps)
+    n = _bend_frames(fps)
+    for v in _ramp(EXT, 0.3, n):
+        r.feed(_g(mid=v))
+    r.feed_n(_g(mid=0.3), 3)
+    assert r.events() == ["click_right"]
+    st = next(s for s in r.states if "click_right" in s.events)
+    assert st.click_bend_ts is not None
+    # ชี้ไม่เหยียด (0.7) + กลางพับ → ไม่คลิกขวา
+    r2 = Rig(fps)
+    r2.feed_n(_g(idx=0.7, mid=0.3), 6)
+    assert "click_right" not in r2.events()
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_no_click_while_clutched_or_off(fps):
+    r = Rig(fps)
+    r.feed_n(_g(0.3, 0.3, 0.3, 0.3), 4)
+    assert r.states[-1].mode == "clutch"
+    r.feed_n(_g(0.3, 0.3, 0.3, 0.3), 6)
+    assert r.count("click_left") == 0
+    t = GestureTracker(GestureConfig())  # ยังไม่ enable
+    for i in range(10):
+        st = t.update(_g(idx=0.3), i * 0.05)
+    assert st.mode == "off" and st.events == ()
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_clutch_release_requires_rearm(fps):
+    r = Rig(fps)
+    r.feed_n(_g(0.3, 0.3, 0.3, 0.3), 4)
+    # ปล่อยกำ: ชี้ยังพับต่ำ แต่ที่เหลือคลาย (mean>up)
+    r.feed_n(_g(idx=0.3, mid=1.0, ring=1.0, pinky=1.0), 4)
+    assert r.states[-1].mode == "move"
+    assert r.count("click_left") == 0
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_hand_lost_during_drag_ends_it_immediately(fps):
+    r = Rig(fps)
+    r.feed_n(_g(pinch=0.02), 4)
+    st = r.t.update(None, r.ts + r.dt)
+    assert st.events == ("drag_end",)
+    assert st.mode == "move"
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_hand_lost_during_scroll_ends_it(fps):
+    r = Rig(fps)
+    r.feed_n(_g(ring=0.3, pinky=0.3), 5)
+    st = r.t.update(None, r.ts + r.dt)
+    assert st.events == ("scroll_end",)
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_toggle_off_during_drag_ends_it_same_frame(fps):
+    r = Rig(fps)
+    # ฝ่ามือ + จีบพร้อมกัน (สังเคราะห์) ค้างจน toggle off
+    palm_pinch = HandFeatures(curl=PALM.curl, pinch=0.02, hand_size=0.2, anchor=(0.5, 0.5),
+                              spread=1.2, palm_facing=0.9)
+    for _ in range(int(1.3 * fps) + 2):
+        r.feed(palm_pinch)
+    ev = r.events()
+    assert "drag_start" in ev and "toggle_off" in ev
+    off_ts = next(t for t, e in r.log if e == "toggle_off")
+    assert (off_ts, "drag_end") in r.log
+    assert r.states[-1].mode == "off"
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_pinch_during_clutch_does_not_start_drag(fps):
+    r = Rig(fps)
+    r.feed_n(_g(0.3, 0.3, 0.3, 0.3), 4)
+    r.feed_n(_g(0.3, 0.3, 0.3, 0.3, pinch=0.02), 6)
+    assert "drag_start" not in r.events()
+
+
+def test_progress_fields():
+    t = GestureTracker(GestureConfig())
+    st = t.update(_g(idx=0.7, mid=0.95, pinch=0.045), 0.0)
+    assert st.index_progress == pytest.approx(0.5)
+    assert st.middle_progress == 0.0
+    assert st.pinch_progress == pytest.approx(0.5)
+    st = t.update(_g(idx=0.3, mid=0.3, pinch=0.01), 0.1)
+    assert st.index_progress == 1.0 and st.middle_progress == 1.0 and st.pinch_progress == 1.0

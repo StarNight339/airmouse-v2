@@ -313,13 +313,37 @@ class FakeMotion:
     def __init__(self):
         self.resets = []
         self.updates = []
+        self.history = {}  # ts -> ตำแหน่ง
+        self.positions = []
+        self.boosts = []
+        self.scroll_resets = 0
+        self.scroll_out = []
 
     def reset(self, xy):
         self.resets.append(xy)
 
-    def update(self, anchor, hand_size, aspect, dt):
+    def update(self, anchor, hand_size, aspect, dt, ts=None):
         self.updates.append((anchor, dt))
-        return (100.0 + len(self.updates), 50.0)
+        out = (100.0 + len(self.updates), 50.0)
+        if ts is not None:
+            self.history[ts] = out
+        return out
+
+    def history_at(self, t):
+        older = [k for k in self.history if k <= t]
+        return self.history[max(older)] if older else self.history[min(self.history)]
+
+    def set_position(self, xy):
+        self.positions.append(xy)
+
+    def boost_smoothing(self, seconds):
+        self.boosts.append(seconds)
+
+    def reset_scroll(self):
+        self.scroll_resets += 1
+
+    def scroll_delta(self, anchor_y, hand_size, dt):
+        return self.scroll_out.pop(0) if self.scroll_out else 0
 
 
 class FakeMouse:
@@ -328,6 +352,7 @@ class FakeMouse:
         self.targets = []
         self.active = []
         self.resyncs = 0
+        self.cmds = []
 
     def resync(self):
         self.resyncs += 1
@@ -340,14 +365,32 @@ class FakeMouse:
     def set_active(self, active):
         self.active.append(active)
 
+    # คำสั่งปุ่ม/scroll เก็บเป็นลำดับเดียว เพื่อตรวจลำดับได้
+    def click_at(self, x, y, btn="left"):
+        self.cmds.append(("click", btn, (x, y)))
+
+    def button_down(self, btn):
+        self.cmds.append(("down", btn))
+
+    def button_up(self, btn):
+        self.cmds.append(("up", btn))
+
+    def scroll(self, delta):
+        self.cmds.append(("scroll", delta))
+
 
 def _feats():
     return HandFeatures(curl={}, pinch=0.1, hand_size=0.2, anchor=(0.5, 0.5))
 
 
-ON = GestureState(True, False, 0.0, False, False)
-OFF = GestureState(False, False, 0.0, False, False)
-CLUTCH = GestureState(True, True, 0.0, False, True)
+ON = GestureState(True, False, 0.0, False, False, mode="move")
+OFF = GestureState(False, False, 0.0, False, False, mode="off")
+CLUTCH = GestureState(True, True, 0.0, False, True, mode="clutch")
+
+
+def _on(*events, mode="move", bend=None):
+    return GestureState(True, False, 0.0, False, False, events=tuple(events), mode=mode,
+                        click_bend_ts=bend)
 
 
 def _controller(states):
@@ -410,3 +453,76 @@ def test_controller_follows_screen_changes():
     mouse.screen = ("new-screen",)
     c.step(_feats(), 1.0, 4 / 3)
     assert m.bounds == ("new-screen",)
+
+
+# --- Phase 3: คลิก / ลาก / scroll ---
+
+def test_click_uses_position_from_before_finger_bend():
+    c, m, mouse = _controller([ON, ON, ON, _on("click_left", bend=1.1)])
+    for i, ts in enumerate((1.0, 1.1, 1.2, 1.3)):
+        c.step(_feats(), ts, 4 / 3)
+    # history: 1.0→101, 1.1→102, 1.2→103, 1.3→104 ; bend ที่ 1.1 (อยู่ในช่วง rollback 150 ms)
+    assert mouse.cmds == [("click", "left", (102.0, 50.0))]
+    assert m.positions == [(102.0, 50.0)]
+
+
+def test_click_rollback_is_capped():
+    c, m, mouse = _controller([ON, ON, ON, ON, _on("click_right", bend=0.5)])
+    for ts in (1.0, 1.1, 1.2, 1.3, 1.4):
+        c.step(_feats(), ts, 4 / 3)
+    # bend เก่าเกิน → ย้อนได้ไม่เกิน 150 ms (1.25 → ตัวอย่างที่ 1.2)
+    assert mouse.cmds == [("click", "right", (103.0, 50.0))]
+
+
+def test_double_click_reuses_first_position():
+    c, m, mouse = _controller([ON, _on("click_left", bend=1.0), ON, _on("click_left", bend=1.2)])
+    for ts in (1.0, 1.05, 1.2, 1.3):
+        c.step(_feats(), ts, 4 / 3)
+    (_, _, p1), (_, _, p2) = mouse.cmds
+    assert p1 == p2  # ห่าง ≤ 4 px และภายใน 500 ms → จุดเดิม
+
+
+def test_drag_down_up_and_boost():
+    c, m, mouse = _controller([ON, _on("drag_start", mode="drag"), _on(mode="drag"),
+                               _on("drag_end")])
+    for ts in (1.0, 1.1, 1.2, 1.3):
+        c.step(_feats(), ts, 4 / 3)
+    assert mouse.cmds == [("down", "left"), ("up", "left")]
+    assert m.boosts == [0.15]
+
+
+def test_hand_lost_while_dragging_releases_button():
+    c, m, mouse = _controller([ON, _on("drag_start", mode="drag"), ON])
+    c.step(_feats(), 1.0, 4 / 3)
+    c.step(_feats(), 1.1, 4 / 3)
+    c.step(None, 1.2, 4 / 3)
+    assert mouse.cmds == [("down", "left"), ("up", "left")]
+
+
+def test_user_mouse_while_dragging_releases_button():
+    c, m, mouse = _controller([_on("drag_start", mode="drag"), _on(mode="drag")])
+    c.step(_feats(), 1.0, 4 / 3)
+    mouse.user_moved = True
+    c.step(_feats(), 1.1, 4 / 3)
+    assert mouse.cmds == [("down", "left"), ("up", "left")]
+
+
+def test_scroll_sends_wheel_and_freezes_cursor_then_resyncs():
+    c, m, mouse = _controller([ON, _on("scroll_start", mode="scroll"), _on(mode="scroll"),
+                               _on("scroll_end"), ON])
+    m.scroll_out = [0, 120]
+    for ts in (1.0, 1.1, 1.2, 1.3, 1.4):
+        c.step(_feats(), ts, 4 / 3)
+    assert mouse.cmds == [("scroll", 120)]
+    assert m.scroll_resets == 1
+    assert len(mouse.targets) == 3  # ไม่มี set_target ระหว่าง scroll 2 เฟรม
+    assert len(m.resets) == 2       # ตอนเริ่ม และหลังจบ scroll
+
+
+def test_controller_activates_mouse_before_enqueuing_click():
+    c, m, mouse = _controller([_on("click_left", bend=1.0)])
+    order = []
+    mouse.set_active = lambda a: order.append(("active", a))
+    mouse.click_at = lambda x, y, btn="left": order.append(("click", btn))
+    c.step(_feats(), 1.0, 4 / 3)
+    assert order == [("active", True), ("click", "left")]
