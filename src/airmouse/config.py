@@ -42,17 +42,19 @@ class MotionConfig:
 
 @dataclass
 class GestureConfig:
-    curl_down: float = 0.60
-    curl_up: float = 0.80
-    pinch_down: float = 0.035
-    pinch_up: float = 0.055
+    curl_down: float = 0.70
+    curl_up: float = 0.82
+    pinch_down: float = 0.017
+    pinch_up: float = 0.030
     confirm_frames: int = 2
-    toggle_hold_ms: int = 1000
+    toggle_hold_ms: int = 700
     switcher_hold_ms: int = 300
     switcher_step: float = 0.6
     min_presence: float = 0.6
-    palm_spread: float = 0.5
-    palm_facing_min: float = 0.3
+    flip_facing_min: float = 0.5
+    normal_facing: int = 0  # ด้านปกติของมือ: -1 / +1 หรือ 0 = เรียนรู้เอง
+    scroll_curl_max: float = 0.78
+    scroll_extend_min: float = 0.75
 
 
 @dataclass

@@ -108,7 +108,10 @@ class Controller:
             self.mouse.resync()
         # ผู้ใช้เพิ่งใช้เมาส์จริง: พักการควบคุมด้วยมือสักครู่ ไม่แย่งกัน
         user_busy = ts - self._user_ts < USER_GRACE_S
-        active = feats is not None and g.enabled and not g.clutch and not user_busy
+        # flip: กำลังพลิกมือ (เปิด/ปิด) → cursor ต้องไม่ตามการหมุนข้อมือ; พลิกกลับแล้ว
+        # _was_active เป็น False จึง reset จากตำแหน่ง cursor ไม่กระโดด
+        active = (feats is not None and g.enabled and g.mode not in ("clutch", "flip")
+                  and not user_busy)
         events = set(g.events)
         target = None
         if not active or "drag_end" in events:
@@ -152,13 +155,14 @@ class InferenceThread(threading.Thread):
     """รอเฟรมใหม่จากกล้อง → MediaPipe → features แล้วเก็บผลล่าสุดไว้ให้ UI อ่าน"""
 
     def __init__(self, camera: Camera, tracker: HandTracker, mirror: bool, debug: bool,
-                 controller: Controller | None = None):
+                 controller: Controller | None = None, log_pose: bool = False):
         super().__init__(name="inference", daemon=True)
         self._camera = camera
         self._tracker = tracker
         self._controller = controller
         self._mirror = mirror
         self._debug = debug
+        self._log_pose = log_pose
         self._lock = threading.Lock()
         self._latest: FrameResult | None = None
         self._stop_event = threading.Event()
@@ -202,6 +206,8 @@ class InferenceThread(threading.Thread):
                                      gesture, target, speed, gain)
                 with self._lock:
                     self._latest = result
+                if self._log_pose and feats is not None:
+                    log.debug("pose t=%.3f %s", ts, _describe_pose(feats, gesture))
                 if stats is not None:
                     stats.add(ts, None if last_ts is None else ts - last_ts, infer_ms, result)
                 last_ts = ts
@@ -247,7 +253,21 @@ class _DebugStats:
                 sum(self._infer) / len(self._infer), max(self._infer),
                 "yes" if r.hand else "no", state, mouse,
             )
+            if r.features is not None:
+                log.debug("hand %s", _describe_pose(r.features, r.gesture))
         self._reset(ts)
+
+
+def _describe_pose(f: HandFeatures, g: GestureState | None) -> str:
+    """ค่าของมือในบรรทัดเดียว (key=value) ไว้จูน threshold และ replay จาก log"""
+    curls = " ".join(f"{k[:3]}={v:.2f}" for k, v in f.curl.items())
+    out = "%s pinch=%.1fcm facing=%+.2f" % (curls, f.pinch * 100, f.palm_facing)
+    if g is not None:
+        out += " mode=%s ns=%+d flip=%.2f" % (g.mode, getattr(g, "normal_sign", 0),
+                                               g.toggle_progress)
+        if g.events:
+            out += " ev=" + ",".join(g.events)
+    return out
 
 
 def _setup_logging(debug: bool) -> None:
@@ -300,10 +320,11 @@ def run(args: argparse.Namespace) -> int:
         controller = Controller(GestureTracker(cfg.gesture), motion, mouse,
                                 click_rollback_s=cfg.motion.click_rollback_ms / 1000,
                                 double_click=win_mouse.double_click_metrics())
-        log.info("จอ (virtual desktop) %s | แบมือค้าง %d ms เพื่อเปิดการควบคุม",
+        log.info("จอ (virtual desktop) %s | พลิกมือค้าง %d ms เพื่อเปิด/ปิดการควบคุม",
                  screen, cfg.gesture.toggle_hold_ms)
 
-        inference = InferenceThread(camera, tracker, cfg.camera.mirror, args.debug, controller)
+        inference = InferenceThread(camera, tracker, cfg.camera.mirror, args.debug, controller,
+                                    log_pose=args.log_pose)
         inference.start()
 
         app = QApplication.instance() or QApplication([])

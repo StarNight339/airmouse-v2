@@ -3,8 +3,16 @@ import pytest
 from airmouse import config
 
 
-def test_repo_config_matches_defaults():
-    assert config.load(config.DEFAULT_CONFIG_PATH) == config.Config()
+def test_repo_config_has_every_key():
+    # ค่าใน config.toml ผู้ใช้ปรับเองได้ (เช่น hand) แต่ต้องมีครบทุก key ของ dataclass
+    import dataclasses
+    import tomllib
+    with config.DEFAULT_CONFIG_PATH.open("rb") as fh:
+        data = tomllib.load(fh)
+    for section in dataclasses.fields(config.Config):
+        expected = {f.name for f in dataclasses.fields(getattr(config.Config(), section.name))}
+        assert set(data[section.name]) == expected, section.name
+    config.load(config.DEFAULT_CONFIG_PATH)  # ต้องโหลดได้ไม่ error
 
 
 def test_missing_file_uses_defaults(tmp_path):

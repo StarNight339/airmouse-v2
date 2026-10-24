@@ -1,35 +1,103 @@
-"""ตรวจท่ามือ: toggle, clutch, drag, scroll, click (pure logic)
+"""ตรวจท่ามือ: toggle (พลิกมือ), clutch, drag, scroll, click (pure logic)
 
-ลำดับความสำคัญเมื่อท่าชนกัน: drag > clutch > scroll > click
+ลำดับความสำคัญเมื่อท่าชนกัน: flip (ปลอดภัยสุด: ตัด drag/scroll) > drag > clutch > scroll > click
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 
 from .config import GestureConfig
 from .features import HandFeatures
 
 FOUR = ("index", "middle", "ring", "pinky")
-LOST_RELEASE_S = 0.5  # มือหายนานเท่านี้ → ล้างเงื่อนไข "ต้องปล่อยฝ่ามือ"
+LOST_RELEASE_S = 0.5   # มือหายนานเท่านี้ → ล้างเงื่อนไข "ต้องพลิกกลับก่อน toggle ซ้ำ"
+LEARN_WINDOW_S = 2.0   # เรียนรู้ด้านปกติจากเฟรมในช่วง ~2 วินาทีล่าสุด
+LEARN_MIN_SAMPLES = 10  # ต้องมีตัวอย่างอย่างน้อยเท่านี้ก่อน commit
+LEARN_MIN_SPAN_S = 1.5  # ต้องสังเกตมาอย่างน้อยเท่านี้ (กันพลิกค้างสั้น ๆ ตอนเริ่มถูกนับเป็นด้านปกติ)
+LEARN_AGREE = 0.8      # ต้องเห็นด้านเดียวกันอย่างน้อยเท่านี้ของตัวอย่าง
+LEARN_MIN_FACING = 0.4  # เฟรมที่ |facing| ต่ำกว่านี้ไม่ใช้เรียนรู้
+CLICK_PINCH_MARGIN = 0.003  # คลิกต้อง pinch > pinch_down + margin (ไม่ใช่ pinch_up)
 
 
 def _clamp01(v: float) -> float:
     return min(1.0, max(0.0, v))
 
 
+def _sign(v: float) -> int:
+    return 1 if v > 0 else -1 if v < 0 else 0
+
+
+# ---- predicates ของท่าดิบ (ไม่มี confirm/hysteresis/arming) ใช้ร่วมกับ debug view ----
+def _rp_mean(c: dict[str, float]) -> float:
+    return (c["ring"] + c["pinky"]) / 2
+
+
+def is_flip(facing: float, normal_sign: int, cfg: GestureConfig) -> bool:
+    return (normal_sign != 0 and _sign(facing) == -normal_sign
+            and abs(facing) > cfg.flip_facing_min)
+
+
+def is_pinch(pinch: float, cfg: GestureConfig) -> bool:
+    return pinch < cfg.pinch_down
+
+
+def is_fist(c: dict[str, float], cfg: GestureConfig) -> bool:
+    return all(c[n] < cfg.curl_down for n in FOUR)
+
+
+def is_scroll_pose(c: dict[str, float], cfg: GestureConfig) -> bool:
+    return (c["index"] > cfg.scroll_extend_min and c["middle"] > cfg.scroll_extend_min
+            and _rp_mean(c) < cfg.scroll_curl_max)
+
+
+def is_click_left(c: dict[str, float], pinch: float, cfg: GestureConfig) -> bool:
+    """ชี้พับนำ (ชี้ <= กลาง; กลางพับตามได้) โดยนางกับก้อยยังเหยียด (ไม่ใช่กำมือ)"""
+    return (c["index"] < cfg.curl_down and c["index"] <= c["middle"]
+            and _rp_mean(c) > cfg.scroll_curl_max
+            and pinch > cfg.pinch_down + CLICK_PINCH_MARGIN)
+
+
+def is_click_right(c: dict[str, float], pinch: float, cfg: GestureConfig) -> bool:
+    return (c["middle"] < cfg.curl_down and c["index"] > cfg.curl_up
+            and _rp_mean(c) > cfg.scroll_curl_max
+            and pinch > cfg.pinch_down + CLICK_PINCH_MARGIN)
+
+
+def raw_pose(feats: HandFeatures, cfg: GestureConfig, normal_sign: int) -> str:
+    """ท่าดิบของเฟรมนี้ ใช้ predicate ชุดเดียวกับ GestureTracker"""
+    c = feats.curl
+    if is_flip(getattr(feats, "palm_facing", 0.0), normal_sign, cfg):
+        return "flip"
+    if is_pinch(feats.pinch, cfg):
+        return "pinch"
+    if is_fist(c, cfg):
+        return "fist"
+    if is_scroll_pose(c, cfg):
+        return "scroll"
+    if is_click_left(c, feats.pinch, cfg):
+        return "click_left"
+    if is_click_right(c, feats.pinch, cfg):
+        return "click_right"
+    return "move"
+
+
 @dataclass(frozen=True)
 class GestureState:
     enabled: bool
     clutch: bool
-    toggle_progress: float
-    open_palm: bool
+    toggle_progress: float             # ความคืบหน้าของการพลิกมือค้าง 0..1
+    open_palm: bool                    # เก็บไว้เพื่อความเข้ากันได้: = flipped
     fist: bool
     events: tuple[str, ...] = ()
-    mode: str = "off"                   # "off" | "move" | "clutch" | "drag" | "scroll"
+    mode: str = "off"                  # "off" | "move" | "flip" | "clutch" | "drag" | "scroll"
     click_bend_ts: float | None = None  # เวลาที่นิ้วเริ่มพับของคลิก (มีค่าเฉพาะเฟรมที่เกิด click)
-    index_progress: float = 0.0         # 0..1 ใกล้ถึงเกณฑ์คลิก
+    index_progress: float = 0.0        # 0..1 ใกล้ถึงเกณฑ์คลิก
     middle_progress: float = 0.0
     pinch_progress: float = 0.0
+    flipped: bool = False              # พลิกมือ (ยืนยัน confirm_frames แล้ว)
+    normal_sign: int = 0               # เครื่องหมาย facing ด้านปกติ (0 = ยังไม่เรียนรู้)
+    learning: bool = False             # กำลังเรียนรู้ด้านปกติ (toggle ยังไม่ทำงาน)
 
 
 class GestureTracker:
@@ -39,10 +107,18 @@ class GestureTracker:
         self.clutch = False
         self.dragging = False
         self.scrolling = False
-        self._palm_n = 0          # จำนวนเฟรมติดกันที่เห็นฝ่ามือ
-        self._palm_start: float | None = None
-        self._need_release = False  # หลัง toggle ต้องปล่อยฝ่ามือก่อน
+        # --- พลิกมือ / toggle ---
+        fixed = getattr(cfg, "normal_facing", 0)
+        self.normal_sign = fixed if fixed in (-1, 1) else 0  # ตั้งใน config = ไม่ต้องเรียนรู้
+        self._learn: deque[tuple[float, int]] = deque()
+        self._learn_t0: float | None = None
+        self._flip_raw = False
+        self._flip_n = 0
+        self._flip_start: float | None = None
+        self._need_release = False  # หลัง toggle ต้องพลิกกลับก่อน
         self._lost_since: float | None = None  # เวลาที่มือหายไปครั้งล่าสุด
+        self._seen = False        # เคยเห็นมือแล้วหรือยัง
+        # --- clutch / drag / scroll ---
         self._fist_n = 0          # เฟรมติดกันที่ท่ากำ (เข้า)
         self._rel_n = 0           # เฟรมติดกันที่ท่าปล่อย (ออก)
         self._pinch_n = 0         # เฟรมติดกันที่จีบ (เข้า)
@@ -57,13 +133,17 @@ class GestureTracker:
         self._idx_bend: float | None = None
         self._mid_bend: float | None = None
 
+    @property
+    def learning(self) -> bool:
+        return self.normal_sign == 0
+
     def _reset_click(self) -> None:
         self._idx_armed = self._mid_armed = False
         self._idx_n = self._mid_n = 0
         self._idx_bend = self._mid_bend = None
 
     def _end_actions(self, events: list[str]) -> None:
-        """ปิด drag/scroll ทันที (มือหาย/ปิดระบบ) เพื่อไม่ให้ปุ่มค้าง"""
+        """ปิด drag/scroll ทันที (มือหาย/ปิดระบบ/พลิกมือ) เพื่อไม่ให้ปุ่มค้าง"""
         if self.dragging:
             self.dragging = False
             events.append("drag_end")
@@ -76,6 +156,8 @@ class GestureTracker:
     def _mode(self) -> str:
         if not self.enabled:
             return "off"
+        if self._flip_raw:
+            return "flip"
         if self.dragging:
             return "drag"
         if self.clutch:
@@ -85,11 +167,12 @@ class GestureTracker:
         return "move"
 
     def _lost(self, ts: float, events: list[str]) -> None:
-        self._palm_n = 0
-        self._palm_start = None
         # _need_release คงไว้ข้ามมือหายสั้น ๆ (dropout 1 เฟรมต้องไม่ทำให้ toggle ซ้ำ)
         if self._lost_since is None:
             self._lost_since = ts
+        self._flip_raw = False
+        self._flip_n = 0
+        self._flip_start = None
         self._fist_n = 0
         self._rel_n = 0
         if self.clutch:
@@ -98,45 +181,67 @@ class GestureTracker:
         self._end_actions(events)
         self._reset_click()
 
+    def _learn_sign(self, facing: float, ts: float) -> None:
+        """เรียนรู้ด้านปกติ: หน้าต่าง ~2 s ของเฟรมที่ |facing| > 0.4 ต้องเห็นด้านเดียวกัน >= 80%
+        (กันกรณีผู้ใช้พลิกมือตั้งแต่เริ่ม) commit แล้วไม่เรียนรู้ใหม่ตลอด session"""
+        if self.normal_sign != 0 or abs(facing) <= LEARN_MIN_FACING:
+            return
+        if self._learn_t0 is None:
+            self._learn_t0 = ts
+        win = self._learn
+        win.append((ts, _sign(facing)))
+        while win and ts - win[0][0] > LEARN_WINDOW_S:
+            win.popleft()
+        n = len(win)
+        if n < LEARN_MIN_SAMPLES or ts - self._learn_t0 < LEARN_MIN_SPAN_S:
+            return
+        pos = sum(1 for _, sg in win if sg > 0)
+        if pos / n >= LEARN_AGREE:
+            self.normal_sign = 1
+        elif (n - pos) / n >= LEARN_AGREE:
+            self.normal_sign = -1
+
     def update(self, feats: HandFeatures | None, ts: float) -> GestureState:
         cfg = self.cfg
         events: list[str] = []
         if feats is None:
             self._lost(ts, events)
             return GestureState(self.enabled, False, 0.0, False, False, tuple(events),
-                                mode=self._mode())
+                                mode=self._mode(), normal_sign=self.normal_sign,
+                                learning=self.learning)
 
         if self._lost_since is not None:
-            if ts - self._lost_since >= LOST_RELEASE_S:  # หายนานพอ ถือว่าปล่อยมือแล้ว
+            gone = ts - self._lost_since
+            if gone >= LOST_RELEASE_S:  # หายนานพอ ถือว่าพลิกกลับแล้ว
                 self._need_release = False
             self._lost_since = None
+        self._seen = True
+
+        facing = getattr(feats, "palm_facing", 0.0)
+        self._learn_sign(facing, ts)
+
         c = feats.curl
         four = [c[n] for n in FOUR]
-        spread_min = getattr(cfg, "palm_spread", 0.5)
-        facing_min = getattr(cfg, "palm_facing_min", 0.3)
-        fist_raw = all(v < cfg.curl_down for v in four)
-        palm_raw = (not fist_raw and all(v > cfg.curl_up for v in c.values())
-                    and getattr(feats, "spread", 0.0) > spread_min
-                    and getattr(feats, "palm_facing", 0.0) > facing_min)
+        fist_raw = is_fist(c, cfg)
 
-        # --- ฝ่ามือค้าง → toggle ---
+        # --- พลิกมือค้าง → toggle (ทำงานเมื่อเรียนรู้ด้านปกติแล้วเท่านั้น) ---
+        flip_raw = is_flip(facing, self.normal_sign, cfg)
+        self._flip_raw = flip_raw
+        self._flip_n = self._flip_n + 1 if flip_raw else 0
+        flipped = self._flip_n >= cfg.confirm_frames
         progress = 0.0
-        self._palm_n = self._palm_n + 1 if palm_raw else 0
-        open_palm = self._palm_n >= cfg.confirm_frames
-        if not palm_raw:
-            self._palm_start = None
+        if not flip_raw:
+            self._flip_start = None
             self._need_release = False
-        elif open_palm and not self._need_release:
-            if self._palm_start is None:
-                self._palm_start = ts
-            if ts < self._palm_start:  # เวลาย้อนหลัง: เริ่มนับใหม่
-                self._palm_start = ts
-            progress = _clamp01((ts - self._palm_start) * 1000.0 / cfg.toggle_hold_ms)
+        elif flipped and not self._need_release:
+            if self._flip_start is None or ts < self._flip_start:  # เวลาย้อนหลัง: เริ่มนับใหม่
+                self._flip_start = ts
+            progress = _clamp01((ts - self._flip_start) * 1000.0 / cfg.toggle_hold_ms)
             if progress >= 1.0:
                 self.enabled = not self.enabled
                 events.append("toggle_on" if self.enabled else "toggle_off")
                 self._need_release = True
-                self._palm_start = None
+                self._flip_start = None
                 progress = 0.0
 
         idx, mid, ring, pinky = four
@@ -149,26 +254,33 @@ class GestureTracker:
         click_ts: float | None = None
         if not self.enabled:
             self._fist_n = self._rel_n = 0
-            if self.clutch:  # กันไว้: ปกติเข้าไม่ถึง เพราะฝ่ามือคลาย clutch ก่อนครบเวลา hold
+            if self.clutch:
                 self.clutch = False
                 events.append("clutch_off")
             self._end_actions(events)  # toggle off ระหว่างลาก/scroll → ปล่อยทันที
             self._reset_click()
             fist = False
+        elif flip_raw:
+            # กำลังพลิกข้อมือ: anchor เลื่อนเพราะการหมุน → ตัด drag/scroll, ไม่เริ่มอะไรใหม่, ไม่คลิก
+            self._end_actions(events)
+            self._fist_n = self._rel_n = 0
+            self._reset_click()
+            fist = self.clutch
         else:
             self._update_drag(pinch, events)
-            self._update_clutch(four, fist_raw, events)
+            self._update_clutch(c, fist_raw, events)
             fist = self.clutch or fist_raw
-            self._update_scroll(idx, mid, ring, pinky, events)
+            self._update_scroll(c, events)
             if self._mode() != "move":
                 self._reset_click()
             else:
-                click_ts = self._update_clicks(idx, mid, ring, pinch, fist_raw, ts, events)
+                click_ts = self._update_clicks(c, pinch, ts, events)
 
-        return GestureState(self.enabled, self.clutch, progress, open_palm, fist, tuple(events),
+        return GestureState(self.enabled, self.clutch, progress, flipped, fist, tuple(events),
                             mode=self._mode(), click_bend_ts=click_ts,
                             index_progress=idx_prog, middle_progress=mid_prog,
-                            pinch_progress=pinch_prog)
+                            pinch_progress=pinch_prog, flipped=flipped,
+                            normal_sign=self.normal_sign, learning=self.learning)
 
     def _update_drag(self, pinch: float, events: list[str]) -> None:
         """จีบค้าง = drag (สำคัญสุด); ปล่อยเมื่อ pinch > pinch_up"""
@@ -177,7 +289,7 @@ class GestureTracker:
             if self.clutch:
                 self._pinch_n = 0
                 return
-            self._pinch_n = self._pinch_n + 1 if pinch < cfg.pinch_down else 0
+            self._pinch_n = self._pinch_n + 1 if is_pinch(pinch, cfg) else 0
             if self._pinch_n >= cfg.confirm_frames:
                 if self.scrolling:
                     self.scrolling = False
@@ -194,8 +306,9 @@ class GestureTracker:
                 self._reset_click()  # ต้องเหยียดนิ้วชี้ใหม่ก่อนคลิก
                 events.append("drag_end")
 
-    def _update_clutch(self, four: list[float], fist_raw: bool, events: list[str]) -> None:
-        """กำหมัด = clutch (ไม่เริ่มขณะ drag); ปล่อยเมื่อ curl เฉลี่ย > curl_up"""
+    def _update_clutch(self, c: dict[str, float], fist_raw: bool, events: list[str]) -> None:
+        """กำหมัด (ทั้ง 4 นิ้ว < curl_down) = clutch (ไม่เริ่มขณะ drag);
+        ออกเมื่อชี้และกลางเหยียด (> curl_up) ค้าง confirm_frames (นางกับก้อยจะยังพับอยู่ก็ได้)"""
         cfg = self.cfg
         if self.dragging:
             self._fist_n = self._rel_n = 0
@@ -210,23 +323,21 @@ class GestureTracker:
                     self.scrolling = False
                     events.append("scroll_end")
         else:
-            mean = sum(four) / len(four)
-            self._rel_n = self._rel_n + 1 if mean > cfg.curl_up else 0
+            out = c["index"] > cfg.curl_up and c["middle"] > cfg.curl_up
+            self._rel_n = self._rel_n + 1 if out else 0
             if self._rel_n >= cfg.confirm_frames:
                 self.clutch = False
                 self._fist_n = 0
                 events.append("clutch_off")
                 self._reset_click()  # ปล่อย clutch แล้วต้อง re-arm
 
-    def _update_scroll(self, idx: float, mid: float, ring: float, pinky: float,
-                       events: list[str]) -> None:
-        """ท่า scroll: ชี้+กลางเหยียด นางกับก้อยพับ"""
+    def _update_scroll(self, c: dict[str, float], events: list[str]) -> None:
+        """ท่า scroll: ชี้+กลาง > scroll_extend_min และค่าเฉลี่ยนางกับก้อย < scroll_curl_max"""
         cfg = self.cfg
         if self.dragging or self.clutch:
             self._scroll_n = 0
             return
-        pose = (idx > cfg.curl_up and mid > cfg.curl_up
-                and ring < cfg.curl_down and pinky < cfg.curl_down)
+        pose = is_scroll_pose(c, cfg)
         if not self.scrolling:
             self._scroll_n = self._scroll_n + 1 if pose else 0
             if self._scroll_n >= cfg.confirm_frames:
@@ -241,10 +352,12 @@ class GestureTracker:
                 events.append("scroll_end")
                 self._reset_click()
 
-    def _update_clicks(self, idx: float, mid: float, ring: float, pinch: float,
-                       fist_raw: bool, ts: float, events: list[str]) -> float | None:
-        """คลิกเฉพาะ mode move; คืน click_bend_ts เมื่อเกิดคลิก"""
+    def _update_clicks(self, c: dict[str, float], pinch: float, ts: float,
+                       events: list[str]) -> float | None:
+        """คลิกเฉพาะ mode move; คืน click_bend_ts เมื่อเกิดคลิก
+        เงื่อนไขท่าอยู่ใน is_click_left / is_click_right (ชุดเดียวกับ raw_pose)"""
         cfg = self.cfg
+        idx, mid = c["index"], c["middle"]
         # armed + เวลาที่เริ่มพับ
         if idx > cfg.curl_up:
             self._idx_armed = True
@@ -256,20 +369,18 @@ class GestureTracker:
             self._mid_bend = None
         elif self._mid_armed and self._mid_bend is None:
             self._mid_bend = ts
-        self._idx_n = self._idx_n + 1 if idx < cfg.curl_down else 0
-        self._mid_n = self._mid_n + 1 if mid < cfg.curl_down else 0
+        left = is_click_left(c, pinch, cfg)
+        right = is_click_right(c, pinch, cfg)
+        self._idx_n = self._idx_n + 1 if left else 0
+        self._mid_n = self._mid_n + 1 if right else 0
 
-        ok = pinch > cfg.pinch_up and not fist_raw
-        # ซ้าย: นิ้วกลางต้องเหยียดอยู่ กันกำมือที่นิ้วชี้พับนำ
-        if ok and self._idx_armed and self._idx_n >= cfg.confirm_frames and mid > cfg.curl_up:
+        if self._idx_armed and self._idx_n >= cfg.confirm_frames:
             bend = self._idx_bend if self._idx_bend is not None else ts
             self._idx_armed = False
             self._idx_n = 0
             events.append("click_left")
             return bend
-        # ขวา: ชี้ต้องเหยียด และนางต้องไม่ถูกพับตาม (กันกำมือที่นิ้วกลางพับนำ)
-        if (ok and self._mid_armed and self._mid_n >= cfg.confirm_frames
-                and idx > cfg.curl_up and ring > cfg.curl_down):
+        if self._mid_armed and self._mid_n >= cfg.confirm_frames:
             bend = self._mid_bend if self._mid_bend is not None else ts
             self._mid_armed = False
             self._mid_n = 0

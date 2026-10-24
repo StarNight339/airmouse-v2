@@ -526,3 +526,13 @@ def test_controller_activates_mouse_before_enqueuing_click():
     mouse.click_at = lambda x, y, btn="left": order.append(("click", btn))
     c.step(_feats(), 1.0, 4 / 3)
     assert order == [("active", True), ("click", "left")]
+
+
+def test_flip_mode_freezes_cursor_and_resyncs_after():
+    flip = GestureState(True, False, 0.5, True, False, mode="flip")
+    c, m, mouse = _controller([ON, flip, flip, ON])
+    for ts in (1.0, 1.1, 1.2, 1.3):
+        c.step(_feats(), ts, 4 / 3)
+    assert mouse.active == [True, False, False, True]
+    assert len(mouse.targets) == 2   # ไม่ขยับระหว่างพลิก
+    assert len(m.resets) == 2        # พลิกกลับแล้วตั้งต้นจาก cursor ใหม่

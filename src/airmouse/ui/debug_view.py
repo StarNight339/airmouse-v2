@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QWidget
 
 from ..config import GestureConfig
 from ..features import ANCHOR_IDS, FINGERS, INDEX_TIP, THUMB_TIP
+from ..gestures import raw_pose
 
 HAND_CONNECTIONS = (
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -17,7 +18,6 @@ HAND_CONNECTIONS = (
 )
 PANEL_W = 280
 PINCH_SCALE_M = 0.12  # ความยาวแถบ pinch เต็มหลอด
-SPREAD_SCALE = 2.0    # ความยาวแถบ spread เต็มหลอด
 FLASH_S = 0.6         # ไฮไลต์ event นานเท่านี้
 FLASH_EVENTS = {
     "click_left": "● คลิกซ้าย",
@@ -44,12 +44,24 @@ _MODE_LABELS = {
     "clutch": ("CLUTCH", YELLOW),
     "drag": ("DRAG (กดค้าง)", RED),
     "scroll": ("SCROLL", JOINT),
+    "flip": ("FLIP (ค้างเพื่อเปิด/ปิด)", YELLOW),
+}
+
+
+POSE_LABELS = {
+    "flip": "พลิกมือ (เปิด/ปิด)",
+    "pinch": "จีบ (ลาก)",
+    "fist": "กำมือ (clutch)",
+    "scroll": "สองนิ้ว (scroll)",
+    "click_left": "พับนิ้วชี้ (คลิกซ้าย)",
+    "click_right": "พับนิ้วกลาง (คลิกขวา)",
+    "move": "มือปกติ (ขยับ)",
 }
 
 
 def _state_label(g) -> tuple[str, QColor]:
     if not g.enabled:
-        return "OFF (แบมือค้างเพื่อเปิด)", MUTED
+        return "OFF (พลิกมือค้างเพื่อเปิด)", MUTED
     return _MODE_LABELS.get(g.mode, ("ON", GREEN))
 
 
@@ -130,7 +142,7 @@ class DebugView(QWidget):
             p.drawEllipse(pts[i], 6, 6)
         g = r.gesture
         if g is not None and g.toggle_progress > 0:
-            # วงความคืบหน้าการค้างท่าแบมือ (toggle)
+            # วงความคืบหน้าการพลิกมือค้าง (toggle)
             c = QPointF(rect.x() + ax * rect.width(), rect.y() + ay * rect.height())
             p.setPen(QPen(YELLOW, 4))
             p.drawArc(QRectF(c.x() - 22, c.y() - 22, 44, 44), 90 * 16,
@@ -174,15 +186,19 @@ class DebugView(QWidget):
         text(f"ขนาดมือ {f.hand_size:.3f}", MUTED)
         y += 4
 
-        text("แบมือ: spread / หันฝ่ามือ", MUTED, size=9)
-        sv = f.spread / SPREAD_SCALE
-        self._bar(p, x, y - 12, bar_w, sv, GREEN if f.spread > self._g.palm_spread else YELLOW,
-                  (self._g.palm_spread / SPREAD_SCALE,), f"spread {f.spread:.2f}")
-        y += 26
+        # พลิกมือ = เปิด/ปิด: facing ฝั่งตรงข้ามกับด้านปกติ (ที่ระบบเรียนรู้เอง)
+        ns = getattr(g, "normal_sign", 0) if g is not None else 0
+        side = {1: "ด้านปกติ = บวก", -1: "ด้านปกติ = ลบ"}.get(ns, "กำลังเรียนรู้ด้านปกติ…")
+        text(f"พลิกมือเพื่อเปิด/ปิด ({side})", MUTED, size=9)
+        flipped = ns != 0 and f.palm_facing * ns < -self._g.flip_facing_min
+        m = self._g.flip_facing_min
         self._bar(p, x, y - 12, bar_w, (f.palm_facing + 1) / 2,
-                  GREEN if f.palm_facing > self._g.palm_facing_min else YELLOW,
-                  ((self._g.palm_facing_min + 1) / 2,), f"facing {f.palm_facing:+.2f}")
+                  YELLOW if flipped else GREEN, ((1 - m) / 2, (1 + m) / 2),
+                  f"facing {f.palm_facing:+.2f}" + ("  ← พลิก" if flipped else ""))
         y += 30
+        # ใช้ predicate ชุดเดียวกับ GestureTracker (ไม่มี confirm/arming) → ไม่หลอกผู้ใช้
+        pose = raw_pose(f, self._g, ns)
+        text(f"ท่าที่เห็น: {POSE_LABELS.get(pose, pose)}", TEXT, size=9)
 
         text("curl  (1.0 = เหยียด)", MUTED, size=9)
         for name in FINGERS:
