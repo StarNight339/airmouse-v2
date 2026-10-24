@@ -57,7 +57,9 @@ class HandTracker:
         options = vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
             running_mode=vision.RunningMode.VIDEO,
-            num_hands=2,  # ตรวจได้ 2 มือ เพื่อเลือกมือที่ตั้งไว้ แล้วไม่สนใจอีกมือ
+            # 1 มือ: ถ้าตั้ง 2 แต่เห็นมือเดียว MediaPipe จะรันตัวตรวจจับมือซ้ำทุกเฟรม
+            # (วัดบนเครื่องนี้: 99 → 64 ms/เฟรม) มือผิดข้างยังถูกกรองทิ้งด้านล่าง
+            num_hands=1,
             min_hand_detection_confidence=min_presence,
             min_hand_presence_confidence=min_presence,
             min_tracking_confidence=min_presence,

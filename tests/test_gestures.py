@@ -12,7 +12,7 @@ def _f(curls=(1.0, 1.0, 1.0, 1.0, 1.0), spread=1.2, facing=0.9) -> HandFeatures:
 PALM = _f()
 FIST = _f(curls=(0.5, 0.3, 0.3, 0.3, 0.3), spread=0.3)
 RELAXED = _f(curls=(0.9, 0.7, 0.7, 0.7, 0.7), spread=0.5)  # mean 0.7 อยู่ระหว่าง down/up
-OPEN_IDX = _f(curls=(0.9, 0.9, 0.9, 0.9, 0.9), spread=0.5)
+OPEN_IDX = _f(curls=(0.9, 0.9, 0.9, 0.9, 0.9), spread=0.3)
 
 
 def _run(t: GestureTracker, feats, t0: float, t1: float, step: float = 0.01):
@@ -72,7 +72,7 @@ def test_progress_grows_from_zero_to_one():
 
 def test_bad_palm_does_not_count():
     t = GestureTracker(GestureConfig())
-    for feats in (_f(spread=0.5), _f(facing=0.0), OPEN_IDX):
+    for feats in (_f(spread=0.3), _f(facing=0.0), OPEN_IDX):
         _, ev, st = _run(t, feats, 0.0, 2.0)
         assert ev == [] and not st.open_palm
 
@@ -107,14 +107,43 @@ def test_clutch_false_while_disabled():
     assert not st.clutch and "clutch_on" not in st.events
 
 
-def test_toggle_off_clears_clutch():
+def test_palm_releases_clutch_before_toggle_off():
+    # toggle ขณะ clutch เข้าไม่ถึงโดยโครงสร้าง: ฝ่ามือทำให้ค่า curl เฉลี่ยสูง → clutch หลุดก่อนครบเวลา hold
     t, ts = _enabled()
     _run(t, FIST, ts + 0.01, ts + 0.05)
     assert t.clutch
-    t.clutch = True
-    # บังคับสถานะ: ฝ่ามือค้างจนปิด
-    _, ev, st = _run(t, PALM, ts + 0.1, ts + 1.3)
-    assert "toggle_off" in ev and not st.clutch and not st.enabled
+    ts2, ev, st = _run(t, PALM, ts + 0.1, ts + 0.2)
+    assert "clutch_off" in ev and not st.clutch and st.enabled
+    _, ev, st = _run(t, PALM, ts2 + 0.01, ts2 + 1.2)
+    assert ev == ["toggle_off"] and not st.clutch
+
+
+def test_one_frame_dropout_does_not_rearm_toggle():
+    t = GestureTracker(GestureConfig())
+    ts, ev, _ = _run(t, PALM, 0.0, 1.05)
+    assert ev == ["toggle_on"]
+    t.update(None, ts + 0.01)  # dropout 1 เฟรม
+    _, ev, st = _run(t, PALM, ts + 0.02, ts + 2.5)
+    assert ev == [] and st.enabled
+
+
+def test_long_loss_clears_release_requirement():
+    t = GestureTracker(GestureConfig())
+    ts, ev, _ = _run(t, PALM, 0.0, 1.05)
+    t.update(None, ts + 0.01)
+    t.update(None, ts + 0.8)
+    _, ev, _ = _run(t, PALM, ts + 0.81, ts + 2.0)
+    assert ev == ["toggle_off"]
+
+
+def test_progress_clamped_when_time_goes_backwards():
+    t = GestureTracker(GestureConfig())
+    for i in range(10):
+        t.update(PALM, 5.0 + i * 0.01)
+    st = t.update(PALM, 4.0)
+    assert 0.0 <= st.toggle_progress <= 1.0
+    _, ev, _ = _run(t, PALM, 4.01, 4.5)
+    assert ev == []  # นับใหม่จาก ts ที่ย้อน ไม่ toggle ก่อนครบ 1 s
 
 
 def test_hand_lost_resets_hold_and_clutch():

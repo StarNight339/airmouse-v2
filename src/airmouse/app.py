@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 
 CAMERA_OPEN_TIMEOUT_S = 10.0
 DEFAULT_DT = 1 / 30
+USER_GRACE_S = 0.4  # หลังผู้ใช้ขยับเมาส์จริง รอเท่านี้ก่อนให้มือควบคุมต่อ
 
 
 @dataclass(frozen=True)
@@ -59,18 +60,28 @@ class Controller:
         self.mouse = mouse
         self._was_active = False
         self._last_ts: float | None = None
+        self._user_ts = float("-inf")  # เวลาล่าสุดที่เห็นผู้ใช้ใช้เมาส์/ทัชแพดจริง
 
     def step(self, feats: HandFeatures | None, ts: float, aspect: float
              ) -> tuple[GestureState, tuple[float, float] | None]:
         g = self.gestures.update(feats, ts)
         dt = DEFAULT_DT if self._last_ts is None else ts - self._last_ts
         self._last_ts = ts
-        active = feats is not None and g.enabled and not g.clutch
+        # จอถูกเสียบ/ถอดหรือเปลี่ยนความละเอียดได้ระหว่างใช้งาน
+        screen = getattr(self.mouse, "screen", None)
+        if screen is not None:
+            self.motion.bounds = screen
+        if self.mouse.user_moved:
+            self._user_ts = ts
+            self.mouse.resync()
+        # ผู้ใช้เพิ่งใช้เมาส์จริง: พักการควบคุมด้วยมือสักครู่ ไม่แย่งกัน
+        user_busy = ts - self._user_ts < USER_GRACE_S
+        active = feats is not None and g.enabled and not g.clutch and not user_busy
         target = None
         if active:
-            # เริ่มควบคุมใหม่ (toggle, ปล่อย clutch, มือกลับมา) หรือผู้ใช้ขยับเมาส์จริง
+            # เริ่มควบคุมใหม่ (toggle, ปล่อย clutch, มือกลับมา, ผู้ใช้เลิกใช้เมาส์)
             # → ตั้งต้นจากตำแหน่ง cursor ปัจจุบัน ไม่ให้กระโดด
-            if not self._was_active or self.mouse.user_moved:
+            if not self._was_active:
                 self.motion.reset(self.mouse.resync())
             target = self.motion.update(feats.anchor, feats.hand_size, aspect, dt)
             self.mouse.set_target(target[0], target[1], dt)

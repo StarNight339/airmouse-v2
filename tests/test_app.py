@@ -392,9 +392,21 @@ def test_controller_hand_lost_deactivates_and_resyncs_on_return():
     assert len(m.resets) == 2
 
 
-def test_controller_user_mouse_move_resyncs():
-    c, m, mouse = _controller([ON, ON])
+def test_controller_user_mouse_pauses_hand_then_resumes_from_cursor():
+    c, m, mouse = _controller([ON] * 4)
     c.step(_feats(), 1.0, 4 / 3)
     mouse.user_moved = True
-    c.step(_feats(), 1.033, 4 / 3)
-    assert len(m.resets) == 2 and not mouse.user_moved
+    c.step(_feats(), 1.033, 4 / 3)            # ผู้ใช้ขยับเมาส์จริง → หยุดทันที
+    assert not mouse.user_moved and mouse.active[-1] is False
+    c.step(_feats(), 1.2, 4 / 3)              # ยังอยู่ในช่วงพัก
+    assert mouse.active[-1] is False and len(mouse.targets) == 1
+    c.step(_feats(), 1.5, 4 / 3)              # พ้นช่วงพัก → ตั้งต้นใหม่จาก cursor
+    assert mouse.active[-1] is True
+    assert len(m.resets) == 2 and len(mouse.targets) == 2
+
+
+def test_controller_follows_screen_changes():
+    c, m, mouse = _controller([ON])
+    mouse.screen = ("new-screen",)
+    c.step(_feats(), 1.0, 4 / 3)
+    assert m.bounds == ("new-screen",)

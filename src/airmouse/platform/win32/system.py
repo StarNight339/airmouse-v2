@@ -17,6 +17,7 @@ PROCESS_PER_MONITOR_DPI_AWARE = 2
 PROCESS_POWER_THROTTLING = 4  # ProcessPowerThrottling (PROCESS_INFORMATION_CLASS)
 PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
 PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
 ABOVE_NORMAL_PRIORITY_CLASS = 0x8000
 
 
@@ -65,7 +66,7 @@ def _time_begin_period() -> bool:
     return True
 
 
-def _disable_power_throttling() -> None:
+def _disable_power_throttling(control_mask: int = PROCESS_POWER_THROTTLING_EXECUTION_SPEED) -> None:
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.GetCurrentProcess.argtypes = []
     k32.GetCurrentProcess.restype = wintypes.HANDLE
@@ -75,8 +76,8 @@ def _disable_power_throttling() -> None:
     k32.SetProcessInformation.restype = wintypes.BOOL
     state = PROCESS_POWER_THROTTLING_STATE(
         PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-        0,  # StateMask=0 + ControlMask=bit -> ปิด throttling ของ execution speed
+        control_mask,
+        0,  # StateMask=0 + ControlMask=bit -> ปิด throttling ของ bit นั้น
     )
     ok = k32.SetProcessInformation(
         k32.GetCurrentProcess(), PROCESS_POWER_THROTTLING,
@@ -115,6 +116,12 @@ def init() -> None:
             _disable_power_throttling()
         except Exception as e:  # noqa: BLE001
             log.warning("ปิด power throttling ไม่สำเร็จ: %s", e)
+        try:
+            # Win11 ไม่เคารพ timer resolution ของโปรเซสที่ถูกบัง/background; แยกเรียกเพื่อให้
+            # Win10 ที่ไม่รู้จัก flag นี้ไม่ทำให้ EXECUTION_SPEED ข้างบนหลุดไปด้วย
+            _disable_power_throttling(PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION)
+        except Exception as e:  # noqa: BLE001
+            log.warning("ตั้ง IGNORE_TIMER_RESOLUTION ไม่สำเร็จ: %s", e)
         try:
             _raise_priority()
         except Exception as e:  # noqa: BLE001

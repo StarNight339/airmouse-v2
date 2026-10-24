@@ -30,7 +30,7 @@ class CameraConfig:
 class MotionConfig:
     mode: str = "relative"  # "relative" | "absolute"
     sensitivity: float = 1.0
-    deadzone: float = 0.004
+    deadzone: float = 0.065
     accel_low_gain: float = 0.4
     accel_high_gain: float = 2.5
     edge_overshoot: float = 0.05
@@ -50,7 +50,7 @@ class GestureConfig:
     switcher_hold_ms: int = 300
     switcher_step: float = 0.6
     min_presence: float = 0.6
-    palm_spread: float = 0.9
+    palm_spread: float = 0.5
     palm_facing_min: float = 0.3
 
 
