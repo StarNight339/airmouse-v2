@@ -268,6 +268,8 @@ class InferenceThread(threading.Thread):
                         log.info("ไม่เห็นมือ %.0f วิ → ประหยัดพลังงาน", life.idle_s)
                     if "exit" in life.events:
                         log.info("ไม่เห็นมือ %.1f นาที → ปิดโปรแกรม", life.idle_s / 60)
+                        if self._controller is not None:  # ระหว่างรอปิด ห้ามเปิดควบคุมใหม่
+                            self._controller.gestures.disable()
                     self._events.extend(life.events)
                 self.fps.tick(ts)
                 result = FrameResult(seq, frame, ts, hand, feats, infer_ms,
@@ -495,7 +497,9 @@ def run(args: argparse.Namespace) -> int:
                  screen, cfg.gesture.toggle_hold_ms)
 
         # ปิดหน้าต่าง terminal = Windows ฆ่าโปรเซสใน ~5 วิ → ปล่อยปุ่มเมาส์ก่อน (ห้ามแตะ Qt)
-        system.install_console_close_handler(lambda: (mouse.stop(), win_mouse.release_all()))
+        # รอ mouse thread จบก่อน (คำสั่ง down ที่ค้างในคิวต้องไม่ถูกส่งหลัง release_all)
+        system.install_console_close_handler(
+            lambda: (mouse.stop(), mouse.join(0.5), win_mouse.release_all()))
 
         lifecycle = Lifecycle(cfg.app, stay=args.stay)
         inference = InferenceThread(camera, tracker, cfg.camera.mirror, args.debug, controller,
