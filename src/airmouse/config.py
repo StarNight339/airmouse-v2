@@ -69,11 +69,24 @@ class AppConfig:
 
 
 @dataclass
+class SnapConfig:
+    enabled: bool = True
+    capture_px: float = 24.0     # ขยายกรอบปุ่มออกเท่านี้ (px) = ระยะที่เริ่มเกาะ
+    search_px: float = 48.0      # รัศมีจุดค้นหาปุ่มรอบ cursor (px)
+    friction: float = 0.35       # บนปุ่ม การขยับ cursor เหลือสัดส่วนนี้ (หนืด)
+    pull_time_s: float = 0.12    # เวลาดูดเข้ากลางปุ่ม (ค่าคงที่ exponential)
+    slow_speed: float = 0.8      # มือช้ากว่านี้ (hand-size/s) จึงดูด
+    escape_speed: float = 2.0    # มือเร็วกว่านี้ ไม่หนืด (สะบัดหลุด)
+    uia: bool = True             # ใช้ UI Automation หาปุ่มในโปรแกรม (ไม่ใช่แค่ปุ่มมุมหน้าต่าง)
+
+
+@dataclass
 class Config:
     camera: CameraConfig = field(default_factory=CameraConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     gesture: GestureConfig = field(default_factory=GestureConfig)
     app: AppConfig = field(default_factory=AppConfig)
+    snap: SnapConfig = field(default_factory=SnapConfig)
 
 
 _CHOICES = {

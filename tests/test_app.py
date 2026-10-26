@@ -631,3 +631,68 @@ def test_exit_event_reaches_main_thread_queue():
     t.join(timeout=1)
     assert t.drain_events().count("exit") == 1
     assert t.drain_events() == []
+
+
+# --- Snap (เกาะปุ่ม) ใน Controller ---
+
+class FakeSnapper:
+    def __init__(self, enabled=True):
+        from types import SimpleNamespace
+        self.cfg = SimpleNamespace(enabled=enabled)
+        self.calls = []
+        self.resets = 0
+
+    def adjust(self, prev, target, speed, dt, targets):
+        self.calls.append((prev, target, list(targets)))
+        return (target[0] - 1.0, target[1]), "BTN"  # ดึงเข้าหาปุ่ม 1 px
+
+    def reset(self):
+        self.resets += 1
+
+
+class FakeFinder:
+    def __init__(self):
+        self.targets = ["T1"]
+        self.probes = []
+        self.active = []
+
+    def set_probe(self, x, y):
+        self.probes.append((x, y))
+
+    def set_active(self, on):
+        self.active.append(on)
+
+
+def _snap_controller(states, enabled=True):
+    m, mouse = FakeMotion(), FakeMouse()
+    s, f = FakeSnapper(enabled), FakeFinder()
+    return Controller(FakeGestures(states), m, mouse, snapper=s, finder=f), m, mouse, s, f
+
+
+def test_snap_adjusts_target_and_syncs_motion_in_move_mode():
+    c, m, mouse, s, f = _snap_controller([ON, ON])
+    c.step(_feats(), 1.0, 4 / 3)
+    c.step(_feats(), 1.1, 4 / 3)
+    assert mouse.targets[-1][:2] == (101.0, 50.0)  # motion 102 → snap ดึงเหลือ 101
+    assert m.positions[-1] == (101.0, 50.0)          # motion.set_position ให้เดินต่อจากจุดเกาะ
+    assert c.hovered == "BTN" and f.probes[-1] == (101.0, 50.0) and f.active[-1] is True
+    assert s.calls[-1][2] == ["T1"]
+
+
+def test_snap_off_while_dragging_and_when_disabled():
+    c, m, mouse, s, f = _snap_controller([ON, _on("drag_start", mode="drag"), _on(mode="drag")])
+    for ts in (1.0, 1.1, 1.2):
+        c.step(_feats(), ts, 4 / 3)
+    assert len(s.calls) == 1            # เฉพาะเฟรม move แรก
+    assert c.hovered is None and f.active[-1] is False
+    c2, m2, mouse2, s2, f2 = _snap_controller([ON, ON], enabled=False)
+    c2.step(_feats(), 1.0, 4 / 3)
+    c2.step(_feats(), 1.1, 4 / 3)
+    assert s2.calls == [] and mouse2.targets[-1][:2] == (102.0, 50.0)
+
+
+def test_snap_resets_when_hand_lost():
+    c, m, mouse, s, f = _snap_controller([ON, ON])
+    c.step(_feats(), 1.0, 4 / 3)
+    c.step(None, 1.1, 4 / 3)
+    assert c.hovered is None and s.resets == 1 and f.active[-1] is False

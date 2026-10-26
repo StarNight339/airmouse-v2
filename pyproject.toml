@@ -13,6 +13,7 @@ dependencies = [
     "opencv-python",
     "PySide6",
     "tomli-w",
+    "comtypes",
 ]
 
 [project.optional-dependencies]

@@ -52,6 +52,7 @@ class FrameResult:
     speed: float = 0.0
     gain: float = 0.0
     life: LifeState | None = None
+    snap: object | None = None  # ปุ่มที่ cursor กำลังเกาะ (Target) หรือ None
 
 
 class Controller:
@@ -63,8 +64,14 @@ class Controller:
 
     def __init__(self, gestures: GestureTracker, motion: Motion, mouse,
                  click_rollback_s: float = 0.15,
-                 double_click: tuple[int, int, int] = (500, 4, 4)):
+                 double_click: tuple[int, int, int] = (500, 4, 4),
+                 snapper=None, finder=None):
         self.gestures = gestures
+        # snap (เกาะปุ่ม): snapper = ตรรกะแม่เหล็ก/หนืด, finder = thread หาปุ่มรอบ cursor
+        self.snapper = snapper
+        self.finder = finder
+        self.hovered = None  # ปุ่มที่ cursor กำลังเกาะ (สำหรับ overlay/debug)
+        self._snap_prev: tuple[float, float] | None = None
         self.motion = motion
         self.mouse = mouse
         self._rollback_s = click_rollback_s
@@ -139,7 +146,9 @@ class Controller:
                 if not self._was_active or self._need_reset:
                     self.motion.reset(self.mouse.resync())
                     self._need_reset = False
+                    self._snap_prev = None
                 target = self.motion.update(feats.anchor, feats.hand_size, aspect, dt, ts=ts)
+                target = self._snap(g.mode, target, dt)
                 self.mouse.set_target(target[0], target[1], dt)
                 if "drag_start" in events and not self._dragging:
                     self.motion.boost_smoothing(DRAG_SMOOTH_S)
@@ -152,8 +161,35 @@ class Controller:
                     self._click("right", g.click_bend_ts, ts)
         if not active:
             self.mouse.set_active(False)  # หลังใส่ button_up แล้ว (up รันเสมอแม้ inactive)
+        if target is None:
+            self._snap_off()
         self._was_active = active
         return g, target
+
+    def _snap(self, mode: str, target: tuple[float, float], dt: float) -> tuple[float, float]:
+        """เกาะปุ่มเฉพาะโหมด move; ไม่ทำตอนลาก (ต้องลากได้อิสระ)"""
+        if self.snapper is None or mode != "move" or not self.snapper.cfg.enabled:
+            self._snap_off()
+            return target
+        targets = self.finder.targets if self.finder is not None else []
+        prev = self._snap_prev if self._snap_prev is not None else target
+        out, self.hovered = self.snapper.adjust(prev, target, self.motion.speed, dt, targets)
+        if out != target:
+            self.motion.set_position(out)  # ให้ motion เดินต่อจากจุดที่เกาะ ไม่เด้งกลับ
+        self._snap_prev = out
+        if self.finder is not None:
+            self.finder.set_probe(*out)
+            self.finder.set_active(True)
+        return out
+
+    def _snap_off(self) -> None:
+        if self.hovered is not None or self._snap_prev is not None:
+            if self.snapper is not None:
+                self.snapper.reset()
+            self.hovered = None
+            self._snap_prev = None
+        if self.finder is not None:
+            self.finder.set_active(False)
 
 
 class PoseRecorder:
@@ -272,9 +308,10 @@ class InferenceThread(threading.Thread):
                             self._controller.gestures.disable()
                     self._events.extend(life.events)
                 self.fps.tick(ts)
+                snap = self._controller.hovered if self._controller is not None else None
                 result = FrameResult(seq, frame, ts, hand, feats, infer_ms,
                                      self._camera.fps.rate, self.fps.rate,
-                                     gesture, target, speed, gain, life)
+                                     gesture, target, speed, gain, life, snap)
                 with self._lock:
                     self._latest = result
                 if recorder is not None:
@@ -375,6 +412,7 @@ class _AppUI:
 
     def __init__(self, app: QApplication, cfg: config_mod.Config, args: argparse.Namespace,
                  inference: InferenceThread, gestures: GestureTracker):
+        # gestures ใช้แค่ request_toggle (thread-safe); snap สลับผ่าน cfg.snap.enabled (bool)
         from .sound import Sounds
         from .ui.cursor_overlay import CursorOverlay
         from .ui.tray import Tray
@@ -396,6 +434,8 @@ class _AppUI:
         self._tray.debug_requested.connect(self._show_debug)
         self._tray.open_config_requested.connect(self._open_config)
         self._tray.quit_requested.connect(app.quit)
+        self._tray.set_snap_checked(cfg.snap.enabled)
+        self._tray.snap_toggled.connect(self._set_snap)
         self._tray.set_status("Air Mouse: ปิดการควบคุม (พลิกมือค้างเพื่อเปิด)", False)
         self._tray.show()
 
@@ -415,6 +455,10 @@ class _AppUI:
         self._view.show()
         self._view.raise_()
         self._view.activateWindow()
+
+    def _set_snap(self, on: bool) -> None:
+        self._cfg.snap.enabled = on  # Snapper อ่าน cfg เดียวกันทุกเฟรม
+        log.info("Snap เกาะปุ่ม: %s", "เปิด" if on else "ปิด")
 
     def _open_config(self) -> None:
         try:
@@ -437,7 +481,8 @@ class _AppUI:
             from .ui.cursor_overlay import overlay_progress
             visible = g is not None and r.hand is not None and not self._exiting
             self._overlay.set_state(g.mode if g else "off",
-                                    overlay_progress(g) if g else 0.0, visible)
+                                    overlay_progress(g) if g else 0.0, visible,
+                                    snapped=r is not None and r.snap is not None)
 
     def _update_status(self, r, g) -> None:  # noqa: ANN001
         if g is None:
@@ -479,6 +524,7 @@ def run(args: argparse.Namespace) -> int:
     tracker = None
     inference = None
     mouse = None
+    finder = None
     try:
         tracker = HandTracker(model_path, cfg.camera.hand, cfg.camera.mirror,
                               cfg.gesture.min_presence)
@@ -488,11 +534,16 @@ def run(args: argparse.Namespace) -> int:
 
         mouse = win_mouse.MouseThread()
         mouse.start()
+        from .platform.win32.targets import TargetFinder
+        from .snap import Snapper
+        finder = TargetFinder(search_px=cfg.snap.search_px, use_uia=cfg.snap.uia)
+        finder.start()
         screen = win_mouse.virtual_screen()
         motion = Motion(cfg.motion, screen, px_per_hand=win_mouse.primary_screen().h)
         controller = Controller(GestureTracker(cfg.gesture), motion, mouse,
                                 click_rollback_s=cfg.motion.click_rollback_ms / 1000,
-                                double_click=win_mouse.double_click_metrics())
+                                double_click=win_mouse.double_click_metrics(),
+                                snapper=Snapper(cfg.snap), finder=finder)
         log.info("จอ (virtual desktop) %s | พลิกมือค้าง %d ms เพื่อเปิด/ปิดการควบคุม",
                  screen, cfg.gesture.toggle_hold_ms)
 
@@ -536,6 +587,9 @@ def run(args: argparse.Namespace) -> int:
             mouse.stop()
             mouse.join(timeout=2)
         win_mouse.release_all()
+        if finder is not None:
+            finder.stop()
+            finder.join(timeout=1)
         camera.stop()
         camera.join(timeout=2)
         if tracker is not None:

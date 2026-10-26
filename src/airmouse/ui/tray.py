@@ -38,6 +38,7 @@ class Tray(QSystemTrayIcon):
     debug_requested = Signal()
     open_config_requested = Signal()
     quit_requested = Signal()
+    snap_toggled = Signal(bool)  # เมนู "Snap เกาะปุ่ม" ถูกติ๊ก/เอาออก
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
@@ -48,6 +49,9 @@ class Tray(QSystemTrayIcon):
         menu = QMenu()
         self._act_toggle = menu.addAction("เปิด/ปิดการควบคุม")
         self._act_toggle.triggered.connect(self.toggle_requested)
+        self._act_snap = menu.addAction("Snap เกาะปุ่ม")
+        self._act_snap.setCheckable(True)
+        self._act_snap.toggled.connect(self.snap_toggled)
         self._act_debug = menu.addAction("หน้าต่าง debug")
         self._act_debug.triggered.connect(self.debug_requested)
         menu.addSeparator()
@@ -66,6 +70,12 @@ class Tray(QSystemTrayIcon):
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.toggle_requested.emit()
+
+    def set_snap_checked(self, on: bool) -> None:
+        """ตั้งสถานะติ๊กเริ่มต้นโดยไม่ยิง snap_toggled"""
+        self._act_snap.blockSignals(True)
+        self._act_snap.setChecked(on)
+        self._act_snap.blockSignals(False)
 
     def set_status(self, text: str, enabled: bool) -> None:
         self.setToolTip(f"Air Mouse — {text}")

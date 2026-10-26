@@ -88,6 +88,7 @@ class CursorOverlay(QWidget):
         self.setFixedSize(SIZE_LOGICAL, SIZE_LOGICAL)
         self._mode = "off"
         self._progress = 0.0
+        self._snapped = False
         self._want_visible = False
         self._last_pos: tuple[int, int] | None = None
         self._styled = False
@@ -96,9 +97,14 @@ class CursorOverlay(QWidget):
         self._timer.timeout.connect(self._follow)
 
     # ---- API ----
-    def set_state(self, mode: str, progress: float, visible: bool) -> None:
-        """อัปเดตโหมด/ความคืบหน้า/การแสดง; repaint เฉพาะเมื่อค่าเปลี่ยน"""
+    def set_state(self, mode: str, progress: float, visible: bool, snapped: bool = False) -> None:
+        """อัปเดตโหมด/ความคืบหน้า/การแสดง; repaint เฉพาะเมื่อค่าเปลี่ยน
+        snapped = cursor กำลังเกาะปุ่ม → วงหนาและทึบขึ้น"""
         progress = min(1.0, max(0.0, float(progress)))
+        if snapped != self._snapped:
+            self._snapped = snapped
+            if visible:
+                self.update()
         if visible != self._want_visible:
             self._want_visible = visible
             if visible:
@@ -165,11 +171,11 @@ class CursorOverlay(QWidget):
         m = RING_W + 1
         rect = QRectF(m, m, self.width() - 2 * m, self.height() - 2 * m)
         fill = QColor(color)
-        fill.setAlpha(60)
+        fill.setAlpha(110 if self._snapped else 60)
         ring = QColor(color)
-        ring.setAlpha(190)
+        ring.setAlpha(255 if self._snapped else 190)
         p.setBrush(fill)
-        p.setPen(QPen(ring, RING_W * 0.5))
+        p.setPen(QPen(ring, RING_W if self._snapped else RING_W * 0.5))
         p.drawEllipse(rect)
         if self._progress > 0.0:
             arc = QColor(color)
