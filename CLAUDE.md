@@ -6,10 +6,12 @@
 ## สถานะ
 - **Phase 1–3:** เสร็จและทดสอบสดแล้ว (tracking, cursor, คลิก/ลาก/scroll)
 - **Phase 4 (lifecycle, low-power, auto-exit, tray, overlay, เสียง):** เขียนเสร็จ (`91cd885`) แต่ยังรอทดสอบสด
-- **Phase 4.5 snap (cursor เกาะปุ่มด้วย UI Automation + แม่เหล็ก/หนืด):** กำลังทำในเซสชันหลักบน `main` ด้วยไฟล์เหล่านี้
-  - `snap.py`
-  - `platform/win32/targets.py`
-  - `[snap]` ใน config
+- **Phase 4.5 snap (cursor เกาะปุ่มด้วย UI Automation + แม่เหล็ก/หนืด):** เขียนเสร็จแล้ว (`snap.py`, `platform/win32/targets.py`, `[snap]` ใน config, เมนู tray "Snap เกาะปุ่ม")
+  - รอทดสอบสด: ปุ่มย่อ/ปิดหน้าต่าง, แท็บ และปุ่มในโปรแกรม
+  - Opus ตรวจรอบแรกยังไม่มีผลก่อน clear context ต้องสั่งตรวจใหม่
+  - เจอแล้ว: NVIDIA Overlay และแอป Dynamic Island บัง UIA `ElementFromPoint` จึงต้องเช็กว่าปุ่มอยู่ในหน้าต่างจริงที่ `WindowFromPoint` คืนมา ทำไว้แล้ว
+  - คอมมิตยังไม่ได้ push: Phase 4 ทั้งหมดและ snap จะ push หลังทดสอบสดผ่าน
+- **branch `custom-ui` (worktree `..\airmouse-v2-ui`):** อีกเซสชันใช้คุยเรื่องการปรับแต่งและ custom UI
 - **Phase 5 (Swipe Switcher) และ Phase 6 (calibrate, โหมดฝึก, polish):** ยังไม่เริ่ม
 
 ## ผู้ใช้

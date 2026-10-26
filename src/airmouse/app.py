@@ -399,6 +399,8 @@ def _setup_logging(debug: bool) -> None:
         format="%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s",
         handlers=handlers,
     )
+    # comtypes log ทุก AddRef/Release ที่ DEBUG (หลายพันบรรทัด/นาที) → ปิดไว้
+    logging.getLogger("comtypes").setLevel(logging.WARNING)
 
 
 EXIT_NOTIFY_MS = 2500  # แสดงแจ้งเตือน "ปิดแล้ว" ก่อนออกจริง
