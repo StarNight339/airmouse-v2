@@ -8,7 +8,18 @@
 - **Phase 4 (lifecycle, low-power, auto-exit, tray, overlay, เสียง):** เขียนเสร็จ (`91cd885`) แต่ยังรอทดสอบสด
 - **Phase 4.5 snap (cursor เกาะปุ่มด้วย UI Automation + แม่เหล็ก/หนืด):** เขียนเสร็จแล้ว (`snap.py`, `platform/win32/targets.py`, `[snap]` ใน config, เมนู tray "Snap เกาะปุ่ม")
   - รอทดสอบสด: ปุ่มย่อ/ปิดหน้าต่าง, แท็บ และปุ่มในโปรแกรม
-  - Opus ตรวจรอบแรกยังไม่มีผลก่อน clear context ต้องสั่งตรวจใหม่
+  - **ผลตรวจจาก Opus (ยังไม่ได้แก้):**
+    1. **BLOCKING:** มือขยับช้าแล้ว cursor ติดอยู่ที่ปุ่มเล็ก (ยืนยันด้วยการจำลอง)
+       - สาเหตุ: `Controller._snap` เรียก `motion.set_position(out)` ทุกเฟรม ทำให้ แรงหนืด 0.35 + แรงดูด ~50% ต่อเฟรม เข้าสู่สมดุลค้างอยู่ใกล้กลางปุ่ม
+       - ผล: มือที่ช้ากว่า `slow_speed` 0.8 (≈400 px/s) หลุดจากปุ่มไม่ได้ และในแถบปุ่มติดกัน cursor จะไหลไปค้างที่ปุ่มสุดท้าย
+       - วิธีแก้: ห้ามป้อนแรงดูดกลับเข้า Motion ให้เก็บตำแหน่ง virtual ที่ยังไม่ snap (ใช้ friction แค่ลดขนาด delta) แล้ว output = virtual + offset ดูดที่จางลงเมื่อ virtual ห่างจากกลางปุ่ม หรือดูดเฉพาะตอนมือแทบนิ่ง (speed ~0.1–0.2) และไม่ดูดสวนทิศ
+       - ต้องเพิ่มเทสต์แบบ closed loop ระหว่าง Controller + Motion จริง เช่น "มือช้าคงที่ต้องหลุดจากปุ่ม 32 px ภายใน N เฟรม"
+    2. **MEDIUM (`targets.py`):** โปรแกรมที่ค้าง (Not Responding) ทำให้ UIA timeout 5 ครั้งติดกันแล้ว `uia = None` ถาวรทั้ง session → เปลี่ยนเป็น backoff ตามเวลา (ปิด 10 วิ แล้วสร้างใหม่) หรือนับความล้มเหลวแยกตาม root hwnd
+    3. **MEDIUM:** จุดค้นหามีแค่ cursor กับวงรัศมี 48 px ปุ่มเล็กที่ห่าง 24–40 px จึงหาไม่เจอ และ hover กระพริบที่ขอบ → เพิ่มวงในรัศมี `capture_px`
+    4. **LOW:** `_click` ไม่ได้อัปเดต `_snap_prev` หลัง `set_position(pos)` ทำให้ cursor ดีดกลับหลังคลิกตอนเกาะปุ่ม
+    5. **LOW:** `set_active(False)` ควร reset `_last_q` ด้วย (ไม่งั้นกลับมาภายใน 0.35 วิ จะได้รายการปุ่มว่าง)
+    - ค่าเริ่มต้นของ snap (slow 0.8, escape 2.0, friction 0.35) ทำให้แทบทุกการขยับตั้งใจโดนหนืด ต้องจูนใหม่จาก pose log หลังแก้ข้อ 1
+    - ส่วนที่ไม่มีปัญหา: COM apartment, พิกัด DPI/physical, thread safety, การย้อนตำแหน่งคลิก
   - เจอแล้ว: NVIDIA Overlay และแอป Dynamic Island บัง UIA `ElementFromPoint` จึงต้องเช็กว่าปุ่มอยู่ในหน้าต่างจริงที่ `WindowFromPoint` คืนมา ทำไว้แล้ว
   - คอมมิตยังไม่ได้ push: Phase 4 ทั้งหมดและ snap จะ push หลังทดสอบสดผ่าน
 - **branch `custom-ui` (worktree `..\airmouse-v2-ui`):** อีกเซสชันใช้คุยเรื่องการปรับแต่งและ custom UI
