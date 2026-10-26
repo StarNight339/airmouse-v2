@@ -33,7 +33,7 @@ PRE_MIN_CUTOFF = 1.5
 PRE_BETA = 6.0
 
 
-HISTORY_S = 0.3          # เก็บตำแหน่ง output ย้อนหลังเท่านี้ (ใช้ย้อนตำแหน่งคลิก)
+HISTORY_S = 0.5          # เก็บตำแหน่ง output ย้อนหลังเท่านี้ (ใช้ย้อนตำแหน่งคลิก)
 BOOST_LEASH = 1.5        # boost_smoothing: คูณรัศมี leash ตอนเริ่ม แล้วลดเชิงเส้นกลับเป็น 1
 BOOST_CUTOFF = 0.5       # boost_smoothing: คูณ min_cutoff ของ pre-filter ตอนเริ่ม
 SCROLL_LEASH = 0.03      # รัศมี deadzone ของ scroll (hand-size) กัน jitter

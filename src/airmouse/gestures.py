@@ -18,6 +18,9 @@ LEARN_MIN_SPAN_S = 1.5  # ต้องสังเกตมาอย่างน
 LEARN_AGREE = 0.8      # ต้องเห็นด้านเดียวกันอย่างน้อยเท่านี้ของตัวอย่าง
 LEARN_MIN_FACING = 0.4  # เฟรมที่ |facing| ต่ำกว่านี้ไม่ใช้เรียนรู้
 CLICK_GUARD_S = 0.1   # หน่วงคลิกเท่านี้ ถ้านิ้วนาง/ก้อยพับตาม (กำมือ) ระหว่างนั้น → ยกเลิก
+# เฟรมถัดไปที่ 10 fps มาถึง ~96 ms (< 100 ms) — ยอมให้เร็วกว่ากำหนดได้นิดหน่อย
+# ไม่งั้นคลิกเลื่อนไปอีก 1 เฟรมเต็ม (~0.1 s)
+CLICK_GUARD_SLACK_S = 0.02
 CLICK_STALE_S = 0.3   # เฟรมถัดไปมาช้ากว่ากำหนดเกินนี้ (กล้องค้าง) → ทิ้งคลิกที่รอ; 10 fps ปกติช้า ~0.1 s
 CLICK_RP_GUARD = 0.88  # ค่าเฉลี่ย curl นาง+ก้อยต่ำกว่านี้ระหว่างหน่วง = กำลังกำมือ
 CLICK_PINCH_MARGIN = 0.003  # คลิกต้อง pinch > pinch_down + margin (ไม่ใช่ pinch_up)
@@ -382,10 +385,11 @@ class GestureTracker:
         # คลิกที่ยืนยันแล้วรอ CLICK_GUARD_S ก่อนส่ง: กำมือที่นิ้วชี้นำจะมีนาง/ก้อยพับตามมา
         if self._pending is not None:
             name, bend, deadline = self._pending
-            if _rp_mean(c) < CLICK_RP_GUARD or ts - deadline > CLICK_STALE_S:
-                # กลายเป็นกำมือ หรือเฟรมขาดหาย (กล้องค้าง) จนคลิกค้างเก่าเกิน → ยกเลิก
+            if (_rp_mean(c) < CLICK_RP_GUARD or pinch <= cfg.pinch_down + CLICK_PINCH_MARGIN
+                    or ts - deadline > CLICK_STALE_S):
+                # กลายเป็นกำมือ, เริ่มจีบ (กำลังจะลาก) หรือเฟรมขาดหาย (กล้องค้าง) → ยกเลิก
                 self._pending = None
-            elif ts >= deadline:
+            elif ts >= deadline - CLICK_GUARD_SLACK_S:
                 self._pending = None
                 events.append(name)
                 return bend

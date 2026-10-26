@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import pytest
 
 from airmouse.config import MotionConfig
-from airmouse.motion import V_HI, V_LO, Motion, gain_curve
+from airmouse.motion import HISTORY_S, V_HI, V_LO, Motion, gain_curve
 
 DT = 1 / 30
 R = 0.065         # รัศมี leash ที่ใช้ทดสอบ (hand-size)
@@ -275,8 +275,8 @@ def test_history_is_trimmed_by_time():
     m = _motion()
     m.update((0.1, 0.5), SIZE, ASPECT, DT, ts=0.0)
     _moving(m, 60)  # 2 s
-    assert m._hist[-1][0] - m._hist[0][0] <= 0.3 + 1e-9
-    assert len(m._hist) <= 12
+    assert m._hist[-1][0] - m._hist[0][0] <= HISTORY_S + 1e-9
+    assert len(m._hist) <= int(HISTORY_S * 30) + 3
 
 
 def test_history_empty_returns_current_position():

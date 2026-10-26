@@ -747,3 +747,24 @@ def test_stale_pending_click_dropped_after_frame_gap():
     r.ts += 1.5
     r.feed_n(NORMAL, 2)
     assert "click_left" not in r.events()
+
+
+@pytest.mark.parametrize("fps", FPS)
+@pytest.mark.parametrize("pose_after", ["pinch", "scroll", "fist"])
+def test_mode_change_inside_click_guard_cancels_click(fps, pose_after):
+    # คลิกยืนยันแล้ว แต่ภายใน CLICK_GUARD_S เปลี่ยนเป็นลาก/scroll/กำมือ → ห้ามคลิก
+    after = {"pinch": PINCH,
+             "scroll": _g(idx=0.97, mid=0.95, ring=0.6, pinky=0.57),
+             "fist": _g(0.4, 0.4, 0.4, 0.4)}[pose_after]
+    r = Rig(fps)
+    r.feed_n(_g(idx=0.74), 2)
+    r.feed_n(after, 6)
+    assert "click_left" not in r.events()
+
+
+def test_click_at_10fps_emits_on_next_frame_after_guard():
+    # dt ~96 ms: ไม่ควรเลื่อนคลิกไปอีกเฟรมเพราะมาเร็วกว่า 100 ms นิดเดียว
+    r = Rig(10)
+    r.dt = 0.096
+    r.feed_n(_g(idx=0.74), 3)  # 2 เฟรม confirm + 1 เฟรม guard
+    assert r.events() == ["click_left"]

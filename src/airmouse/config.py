@@ -34,7 +34,7 @@ class MotionConfig:
     accel_low_gain: float = 0.4
     accel_high_gain: float = 2.5
     edge_overshoot: float = 0.05
-    click_rollback_ms: int = 150
+    click_rollback_ms: int = 300
     min_cutoff: float = 1.0
     beta: float = 0.007
     scroll_speed: float = 600.0
