@@ -24,6 +24,8 @@ CLICK_GUARD_SLACK_S = 0.02
 CLICK_STALE_S = 0.3   # เฟรมถัดไปมาช้ากว่ากำหนดเกินนี้ (กล้องค้าง) → ทิ้งคลิกที่รอ; 10 fps ปกติช้า ~0.1 s
 CLICK_RP_GUARD = 0.88  # ค่าเฉลี่ย curl นาง+ก้อยต่ำกว่านี้ระหว่างหน่วง = กำลังกำมือ
 CLICK_PINCH_MARGIN = 0.003  # คลิกต้อง pinch > pinch_down + margin (ไม่ใช่ pinch_up)
+SCROLL_HOLD_MIDDLE = 0.55    # ค้าง scroll: นิ้วกลางต่ำได้ถึงเท่านี้
+SCROLL_HOLD_RP_MARGIN = 0.07  # ค้าง scroll: นาง/ก้อยเหยียดขึ้นได้เกิน scroll_curl_max เท่านี้
 PINCH_MEDIAN_N = 5     # median ของระยะจีบกี่เฟรม (~0.3 s ที่ 16 fps) ตัดค่ากระโดดเฟรมเดียว
 
 
@@ -57,6 +59,12 @@ def is_fist(c: dict[str, float], cfg: GestureConfig) -> bool:
 def is_scroll_pose(c: dict[str, float], cfg: GestureConfig) -> bool:
     return (c["index"] > cfg.scroll_extend_min and c["middle"] > cfg.scroll_extend_min
             and _rp_mean(c) < cfg.scroll_curl_max)
+
+
+def is_scroll_hold(c: dict[str, float], cfg: GestureConfig) -> bool:
+    """เกณฑ์ "ยังอยู่ในท่า scroll" (hysteresis): ชี้ยังเหยียดพอ, กลางงอตามได้, นาง/ก้อยยังพับ"""
+    return (c["index"] > cfg.curl_down and c["middle"] > SCROLL_HOLD_MIDDLE
+            and _rp_mean(c) < cfg.scroll_curl_max + SCROLL_HOLD_RP_MARGIN)
 
 
 def is_click_left(c: dict[str, float], pinch: float, cfg: GestureConfig) -> bool:
@@ -360,7 +368,9 @@ class GestureTracker:
                 self._scroll_off_n = 0
                 events.append("scroll_start")
         else:
-            self._scroll_off_n = 0 if pose else self._scroll_off_n + 1
+            # ระหว่าง scroll นิ้วกลางมักงอตามลงไป 0.6–0.7 → ใช้เกณฑ์ค้างท่าที่หลวมกว่าเกณฑ์เข้า
+            hold = is_scroll_hold(c, cfg)
+            self._scroll_off_n = 0 if hold else self._scroll_off_n + 1
             if self._scroll_off_n >= cfg.confirm_frames:
                 self.scrolling = False
                 self._scroll_n = 0

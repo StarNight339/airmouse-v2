@@ -261,7 +261,8 @@ class _DebugStats:
 def _describe_pose(f: HandFeatures, g: GestureState | None) -> str:
     """ค่าของมือในบรรทัดเดียว (key=value) ไว้จูน threshold และ replay จาก log"""
     curls = " ".join(f"{k[:3]}={v:.2f}" for k, v in f.curl.items())
-    out = "%s pinch=%.1fcm facing=%+.2f" % (curls, f.pinch * 100, f.palm_facing)
+    out = "%s pinch=%.1fcm facing=%+.2f ax=%.3f ay=%.3f hs=%.3f" % (
+        curls, f.pinch * 100, f.palm_facing, f.anchor[0], f.anchor[1], f.hand_size)
     if g is not None:
         out += " mode=%s ns=%+d flip=%.2f" % (g.mode, getattr(g, "normal_sign", 0),
                                                g.toggle_progress)

@@ -806,3 +806,15 @@ def test_pinch_spikes_do_not_break_drag(fps):
     assert r.events() == ["drag_start"]
     r.feed_n(_g(pinch=0.07), 6)
     assert r.events() == ["drag_start", "drag_end"]
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_scroll_holds_while_middle_cobends(fps):
+    # ค่าจริงจาก log: ระหว่าง scroll นิ้วกลางงอลง 0.62–0.70 (เดิมหลุดท่าทันที)
+    r = Rig(fps)
+    r.feed_n(SCROLL, 4)
+    r.feed_n(_g(idx=0.78, mid=0.67, ring=0.64, pinky=0.59), fps)
+    r.feed_n(_g(idx=0.88, mid=0.68, ring=0.60, pinky=0.58), fps)
+    assert r.events() == ["scroll_start"] and r.states[-1].mode == "scroll"
+    r.feed_n(NORMAL, 4)  # เหยียดทุกนิ้ว → จบ scroll
+    assert r.events() == ["scroll_start", "scroll_end"]

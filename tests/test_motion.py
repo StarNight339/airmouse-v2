@@ -363,21 +363,43 @@ def test_scroll_first_call_zero_and_direction():
 
 
 def test_scroll_remainder_is_accumulated_not_lost():
+    # จอยสติ๊ก: ค้างมือที่ระยะคงที่ → wheel ต่อวินาทีคงที่ เศษต่อเฟรม (< 1 unit) ไม่หาย
     m = _motion()
-    speed = getattr(m.cfg, "scroll_speed", 600.0)
-    m.scroll_delta(0.9, SIZE, DT)
-    y, total = 0.9, 0
-    n = 120
-    step = 0.0007  # ช้า: ต่อเฟรมได้ไม่ถึง 1 wheel unit หลังหัก deadzone
-    for _ in range(n):
-        y -= step
-        total += m.scroll_delta(y, SIZE, DT)
-    # ผลรวมเข้าใกล้ (ระยะทั้งหมด − deadzone − lag ของ filter) × speed / size ภายใน 1-2 unit
+    speed = m.cfg.scroll_speed
+    m.scroll_delta(0.5, SIZE, DT)
+    off = 0.1001  # เกิน deadzone (0.10 hand-size) นิดเดียว → ~0.24 wheel/s
+    y = 0.5 - off * SIZE
+    for _ in range(30):
+        m.scroll_delta(y, SIZE, DT)  # ให้ filter เข้าที่
+    total = sum(m.scroll_delta(y, SIZE, DT) for _ in range(30 * 60))  # 60 วิ
+    ideal = speed * (off - 0.10) * 60
     assert isinstance(total, int)
-    moved = n * step
-    ideal = (moved / SIZE) * speed
-    assert 0 < total <= ideal
-    assert total >= ideal - speed * (0.03 + 0.2 * step * 30 / SIZE) - 2  # หัก leash + lag
+    assert abs(total - ideal) <= 2
+
+
+def test_scroll_joystick_rate_and_direction():
+    m = _motion()
+    m.scroll_delta(0.5, SIZE, DT)
+    # ค้างมือต่ำกว่าจุดเริ่ม 0.4 hand-size 1 วิ → scroll ลง ~ speed × 0.3 wheel
+    down = sum(m.scroll_delta(0.5 + 0.4 * SIZE, SIZE, DT) for _ in range(30))
+    assert down < 0
+    assert abs(down) == pytest.approx(m.cfg.scroll_speed * 0.3, rel=0.25)
+    m.reset_scroll()
+    m.scroll_delta(0.5, SIZE, DT)
+    up = sum(m.scroll_delta(0.5 - 0.4 * SIZE, SIZE, DT) for _ in range(30))
+    assert up > 0
+    # ภายใน deadzone ไม่ scroll เลย แม้ค้างนาน
+    m.reset_scroll()
+    m.scroll_delta(0.5, SIZE, DT)
+    assert sum(m.scroll_delta(0.5 + 0.08 * SIZE, SIZE, DT) for _ in range(90)) == 0
+
+
+def test_scroll_rate_is_capped():
+    from airmouse.motion import SCROLL_MAX_RATE
+    m = _motion()
+    m.scroll_delta(0.5, SIZE, DT)
+    far = sum(m.scroll_delta(0.5 + 5.0 * SIZE, SIZE, DT) for _ in range(30))
+    assert abs(far) <= SCROLL_MAX_RATE * 1.0 + 1
 
 
 def test_scroll_ignores_jitter():

@@ -36,7 +36,9 @@ PRE_BETA = 6.0
 HISTORY_S = 0.5          # เก็บตำแหน่ง output ย้อนหลังเท่านี้ (ใช้ย้อนตำแหน่งคลิก)
 BOOST_LEASH = 1.5        # boost_smoothing: คูณรัศมี leash ตอนเริ่ม แล้วลดเชิงเส้นกลับเป็น 1
 BOOST_CUTOFF = 0.5       # boost_smoothing: คูณ min_cutoff ของ pre-filter ตอนเริ่ม
-SCROLL_LEASH = 0.03      # รัศมี deadzone ของ scroll (hand-size) กัน jitter
+# scroll แบบจอยสติ๊ก: ระยะมือจากจุดที่เริ่มท่า scroll = ความเร็ว (ไม่ต้องเลื่อนมือไกลจนหลุดกล้อง)
+SCROLL_JOY_DZ = 0.10     # ระยะ (hand-size) รอบจุดเริ่มที่ยังไม่ scroll กันมือสั่น
+SCROLL_MAX_RATE = 3000.0  # wheel/s สูงสุด (= 25 notch/s)
 SCROLL_CUTOFF = 3.0      # pre-filter ของ scroll (Hz) เบากว่าของ cursor เพราะมือเคลื่อนช้า/จงใจ
 
 
@@ -138,20 +140,20 @@ class Motion:
         self._s_acc = 0.0
 
     def scroll_delta(self, anchor_y: float, hand_size: float, dt: float) -> int:
-        """ขยับมือขึ้น (anchor_y ลด) = บวก; เศษของ wheel สะสมไว้ ไม่ทิ้ง"""
+        """จอยสติ๊ก: มือสูงกว่าจุดเริ่ม = scroll ขึ้น (บวก), ต่ำกว่า = ลง; ยิ่งห่างยิ่งเร็ว
+        ความเร็ว = scroll_speed × (ระยะ − deadzone) wheel/s; เศษสะสมไว้ ไม่ทิ้ง"""
         dt_c = min(DT_MAX, max(DT_MIN, dt))
         y = self._sf(anchor_y, dt_c)
         if self._s_ref is None:
             self._s_ref = y
             return 0
         size = max(hand_size, 1e-6)
-        radius = SCROLL_LEASH * size
-        e = y - self._s_ref
-        if abs(e) <= radius:
+        off = (self._s_ref - y) / size  # หน่วย hand-size, บวก = มือยกขึ้น
+        mag = abs(off) - SCROLL_JOY_DZ
+        if mag <= 0:
             return 0
-        step = e - radius if e > 0 else e + radius
-        self._s_ref += step
-        self._s_acc += -step / size * getattr(self.cfg, "scroll_speed", 600.0)
+        rate = min(SCROLL_MAX_RATE, getattr(self.cfg, "scroll_speed", 2400.0) * mag)
+        self._s_acc += rate * dt_c * (1 if off > 0 else -1)
         n = int(self._s_acc)  # ตัดเข้าหา 0 เศษคงไว้ใน _s_acc
         self._s_acc -= n
         return n
