@@ -23,7 +23,7 @@ NORMAL = _g()
 FLIP = _g(facing=FLIP_FACING)
 FIST = _g(idx=0.45, mid=0.45, ring=0.48, pinky=0.48)
 SCROLL = _g(idx=0.96, mid=0.95, ring=0.6, pinky=0.57)
-PINCH = _g(pinch=0.012)
+PINCH = _g(idx=0.72, pinch=0.020)  # ค่าจริง: จีบค้าง 1.9–2.2 cm นิ้วชี้งอ 0.71–0.73
 
 
 class Rig:
@@ -310,7 +310,7 @@ def test_deliberate_pinch_drags_and_releases(fps):
     assert r.states[-1].mode == "drag" and r.states[-1].pinch_progress == 1.0
     r.feed_n(_g(idx=0.3, pinch=0.012), 5)  # ระหว่างลาก ชี้พับก็ไม่คลิก
     assert "click_left" not in r.events()
-    r.feed_n(NORMAL, 3)
+    r.feed_n(NORMAL, 5)  # median 5 เฟรม → ปล่อยหลังค่าห่างครองเสียงข้างมาก
     assert r.events() == ["drag_start", "drag_end"]
     assert r.states[-1].mode == "move"
 
@@ -535,10 +535,11 @@ def test_hand_lost_resets_clutch_and_flip_hold(fps):
 
 def test_progress_fields():
     t = GestureTracker(GestureConfig())
-    st = t.update(_g(idx=0.805, mid=0.96, pinch=0.0235), 0.0)  # กึ่งกลาง click 0.77–0.84
+    st = t.update(_g(idx=0.805, mid=0.96, pinch=0.0275), 0.0)  # กึ่งกลาง click 0.77–0.84 / pinch 2.3–3.2
     assert st.index_progress == pytest.approx(0.5)
     assert st.middle_progress == 0.0
     assert st.pinch_progress == pytest.approx(0.5)
+    t = GestureTracker(GestureConfig())  # median ของระยะจีบ: ใช้ tracker ใหม่ให้ค่าเดียวล้วน
     st = t.update(_g(idx=0.3, mid=0.3, pinch=0.01), 0.1)
     assert st.index_progress == 1.0 and st.middle_progress == 1.0 and st.pinch_progress == 1.0
 
@@ -558,7 +559,7 @@ FIST_SAMPLES = [(0.40, 0.42, 0.50, 0.38), (0.55, 0.50, 0.66, 0.45), (0.45, 0.55,
 def test_click_with_cobending_middle_clicks_once_each(fps):
     r = Rig(fps)
     for idx, mid in CLICK_SAMPLES:
-        r.feed_n(_g(idx=idx, mid=mid, ring=0.97, pinky=0.94, pinch=0.023), 3)
+        r.feed_n(_g(idx=idx, mid=mid, ring=0.97, pinky=0.94, pinch=0.03), 6)
         r.feed_n(NORMAL, 3)
     assert r.events() == ["click_left"] * len(CLICK_SAMPLES)
 
@@ -574,17 +575,17 @@ def test_real_fist_samples_do_not_click(fps):
 
 @pytest.mark.parametrize("fps", FPS)
 def test_pinch_gate_for_click_and_drag_thresholds(fps):
-    # ตอนพับชี้ ปลายนิ้วเข้าใกล้กัน (2.0–2.5 cm) ยังต้องคลิกได้และไม่ลาก
+    # 2.8 cm: เหนือ gate คลิก (pinch_down 2.2 + 0.3) → คลิกได้ ไม่ลาก
     r = Rig(fps)
-    r.feed_n(_g(idx=0.55, mid=0.62, pinch=0.021), 6)
+    r.feed_n(_g(idx=0.55, mid=0.62, pinch=0.028), 6)
     assert r.events() == ["click_left"]
-    # 1.9 cm: ต่ำกว่า gate (pinch_down+0.003) ไม่คลิก แต่ยังไม่ถึงเกณฑ์ลาก (1.7 cm)
+    # 2.4 cm: ต่ำกว่า gate (2.2 + 0.3) ไม่คลิก แต่ยังไม่ถึงเกณฑ์ลาก
     r2 = Rig(fps)
-    r2.feed_n(_g(idx=0.55, mid=0.62, pinch=0.019), 6)
+    r2.feed_n(_g(idx=0.55, mid=0.62, pinch=0.024), 6)
     assert r2.events() == []
-    # 1.5 cm = จีบจริง → ลาก ไม่คลิก
+    # 2.0 cm + ชี้งอ = จีบจริง → ลาก ไม่คลิก
     r3 = Rig(fps)
-    r3.feed_n(_g(idx=0.55, mid=0.62, pinch=0.015), 4)
+    r3.feed_n(_g(idx=0.55, mid=0.62, pinch=0.020), 6)
     assert r3.events() == ["drag_start"]
 
 
@@ -641,9 +642,10 @@ def test_raw_pose_labels_with_real_samples():
         (PINCH, "pinch"),
         (FIST, "fist"),
         (SCROLL, "scroll"),
-        (_g(idx=0.55, mid=0.60, pinch=0.023), "click_left"),
+        (_g(idx=0.55, mid=0.60, pinch=0.028), "click_left"),
         (_g(mid=0.5, pinch=0.05), "click_right"),
-        (_g(idx=0.55, mid=0.60, pinch=0.019), "move"),  # ต่ำกว่า gate
+        (_g(idx=0.55, mid=0.60, pinch=0.024), "move"),  # ต่ำกว่า gate คลิก ยังไม่ถึงจีบ
+        (_g(pinch=0.020), "pinch"),  # จีบโดยชี้เหยียดตรงก็นับ (ผู้ใช้จีบแบบนี้จริง)
     ]
     for feats, want in cases:
         assert raw_pose(feats, cfg, -1) == want
@@ -768,3 +770,39 @@ def test_click_at_10fps_emits_on_next_frame_after_guard():
     r.dt = 0.096
     r.feed_n(_g(idx=0.74), 3)  # 2 เฟรม confirm + 1 เฟรม guard
     assert r.events() == ["click_left"]
+
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_real_sustained_pinch_drags_without_click(fps):
+    # ค่าจริงจาก log 21:15: จีบค้าง ~4 วิ ที่ 1.9–2.2 cm นิ้วชี้งอ 0.71–0.73 (เดิมไม่ลาก แต่คลิกหลอก)
+    r = Rig(fps)
+    vals = [(0.024, 0.74), (0.022, 0.73), (0.021, 0.71), (0.020, 0.72), (0.019, 0.71), (0.021, 0.72)]
+    for i in range(4 * fps):
+        p, idx = vals[i % len(vals)]
+        r.feed(_g(idx=idx, mid=0.95, pinch=p))
+    assert r.events() == ["drag_start"]
+    r.feed_n(NORMAL, 4)
+    assert r.events() == ["drag_start", "drag_end"]
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_rest_pose_close_thumb_never_drags(fps):
+    # ท่าพัก 2.5–3.5 cm มีค่าแวบลง 2.0 cm เฟรมเดียวเป็นระยะ → median ตัดทิ้ง ห้ามลาก
+    r = Rig(fps)
+    for i in range(3 * fps):
+        r.feed(_g(pinch=0.020 if i % 4 == 0 else 0.025 + 0.01 * ((i % 3) / 2)))
+    assert r.events() == []
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_pinch_spikes_do_not_break_drag(fps):
+    # ค่าจริง: ระหว่างจีบค้างค่ากระโดดไป 3–7 cm 1–2 เฟรม (ตรวจพลาด) → การลากต้องไม่หลุด
+    r = Rig(fps)
+    seq = [0.011, 0.012, 0.061, 0.010, 0.013, 0.067, 0.075, 0.012, 0.011, 0.013]
+    r.feed_n(PINCH, 3)
+    for p in seq * 3:
+        r.feed(_g(idx=0.92, pinch=p))
+    assert r.events() == ["drag_start"]
+    r.feed_n(_g(pinch=0.07), 6)
+    assert r.events() == ["drag_start", "drag_end"]

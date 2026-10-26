@@ -46,8 +46,8 @@ class GestureConfig:
     curl_up: float = 0.82
     click_curl_down: float = 0.77
     click_curl_up: float = 0.84
-    pinch_down: float = 0.017
-    pinch_up: float = 0.030
+    pinch_down: float = 0.022
+    pinch_up: float = 0.033
     confirm_frames: int = 2
     toggle_hold_ms: int = 700
     switcher_hold_ms: int = 300

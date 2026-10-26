@@ -24,6 +24,7 @@ CLICK_GUARD_SLACK_S = 0.02
 CLICK_STALE_S = 0.3   # เฟรมถัดไปมาช้ากว่ากำหนดเกินนี้ (กล้องค้าง) → ทิ้งคลิกที่รอ; 10 fps ปกติช้า ~0.1 s
 CLICK_RP_GUARD = 0.88  # ค่าเฉลี่ย curl นาง+ก้อยต่ำกว่านี้ระหว่างหน่วง = กำลังกำมือ
 CLICK_PINCH_MARGIN = 0.003  # คลิกต้อง pinch > pinch_down + margin (ไม่ใช่ pinch_up)
+PINCH_MEDIAN_N = 5     # median ของระยะจีบกี่เฟรม (~0.3 s ที่ 16 fps) ตัดค่ากระโดดเฟรมเดียว
 
 
 def _clamp01(v: float) -> float:
@@ -45,6 +46,7 @@ def is_flip(facing: float, normal_sign: int, cfg: GestureConfig) -> bool:
 
 
 def is_pinch(pinch: float, cfg: GestureConfig) -> bool:
+    """จีบ = โป้ง–ชี้ใกล้กัน (GestureTracker ส่งค่าที่ผ่าน median filter แล้ว)"""
     return pinch < cfg.pinch_down
 
 
@@ -139,6 +141,7 @@ class GestureTracker:
         self._idx_bend: float | None = None
         self._mid_bend: float | None = None
         self._pending: tuple[str, float, float] | None = None  # (event, bend_ts, deadline)
+        self._pinch_hist: deque[float] = deque(maxlen=PINCH_MEDIAN_N)
 
     @property
     def learning(self) -> bool:
@@ -175,6 +178,7 @@ class GestureTracker:
         return "move"
 
     def _lost(self, ts: float, events: list[str]) -> None:
+        self._pinch_hist.clear()
         # _need_release คงไว้ข้ามมือหายสั้น ๆ (dropout 1 เฟรมต้องไม่ทำให้ toggle ซ้ำ)
         if self._lost_since is None:
             self._lost_since = ts
@@ -253,7 +257,9 @@ class GestureTracker:
                 progress = 0.0
 
         idx, mid, ring, pinky = four
-        pinch = feats.pinch
+        # ระยะจีบกระโดด 1–2 เฟรม (3–7 cm) ระหว่างจีบค้างบ่อย → ใช้ median ของหลายเฟรม
+        self._pinch_hist.append(feats.pinch)
+        pinch = sorted(self._pinch_hist)[len(self._pinch_hist) // 2]
         span = cfg.click_curl_up - cfg.click_curl_down
         idx_prog = _clamp01((cfg.click_curl_up - idx) / span)
         mid_prog = _clamp01((cfg.click_curl_up - mid) / span)
@@ -282,7 +288,8 @@ class GestureTracker:
             if self._mode() != "move":
                 self._reset_click()
             else:
-                click_ts = self._update_clicks(c, pinch, ts, events)
+                # คลิกใช้ระยะดิบ (ชุดเดียวกับ raw_pose): เริ่มจีบต้องยกเลิกคลิกที่รออยู่ทันที
+                click_ts = self._update_clicks(c, feats.pinch, ts, events)
 
         return GestureState(self.enabled, self.clutch, progress, flipped, fist, tuple(events),
                             mode=self._mode(), click_bend_ts=click_ts,
