@@ -35,6 +35,8 @@ scroll_curl_max = 0.78    # scroll: ค่าเฉลี่ย curl นิ้�
 scroll_extend_min = 0.75  # scroll: นิ้วชี้และนิ้วกลางต้องเหยียดเกินนี้
 
 [app]
-auto_exit_minutes = 10
-low_power_after_s = 3
-sounds = true
+auto_exit_minutes = 10    # มือหายครบเท่านี้ (นาที) → ปิดโปรแกรมเอง; 0 = ไม่ปิด (หรือรันด้วย --stay)
+low_power_after_s = 3     # มือหายเกินนี้ (วินาที) → ประหยัดพลังงาน + ปิดการควบคุม
+low_power_fps = 6         # อัตรา inference ช่วงประหยัดพลังงาน
+sounds = true             # เสียงตอนคลิก/ลาก/เปิดปิด
+overlay = true            # วงสถานะตาม cursor

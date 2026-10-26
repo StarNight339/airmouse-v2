@@ -1,7 +1,7 @@
 """หน้าต่าง debug: ภาพกล้อง + landmark, ค่า curl ทุกนิ้ว, pinch และ FPS"""
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
@@ -66,6 +66,8 @@ def _state_label(g) -> tuple[str, QColor]:
 
 
 class DebugView(QWidget):
+    closed = Signal()  # ผู้ใช้ปิดหน้าต่าง (Esc/q/ปุ่มปิด)
+
     def __init__(self, inference, gesture: GestureConfig):
         super().__init__()
         self._inference = inference
@@ -94,9 +96,14 @@ class DebugView(QWidget):
         else:
             super().keyPressEvent(event)
 
+    def showEvent(self, event) -> None:
+        self._timer.start(15)  # เปิดซ้ำจากเมนู tray ได้
+        super().showEvent(event)
+
     def closeEvent(self, event) -> None:
         self._timer.stop()
         super().closeEvent(event)
+        self.closed.emit()
 
     # ---------- วาด ----------
 

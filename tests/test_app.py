@@ -581,3 +581,53 @@ def test_inference_thread_records_pose_when_enabled(tmp_path, monkeypatch, run_t
     files = list(tmp_path.glob("*-pose.jsonl"))
     assert len(files) == 1
     assert len(files[0].read_text(encoding="utf-8").splitlines()) == 2
+
+
+# --- Phase 4: lifecycle ใน InferenceThread ---
+
+class CountingTracker(FakeTracker):
+    """นับจำนวนเฟรมที่รัน inference จริง (ใช้วัดการข้ามเฟรมช่วงประหยัดพลังงาน)"""
+
+
+def _lifecycle(low_power_after_s=0.3, auto_exit_minutes=0.0):
+    from airmouse.config import AppConfig
+    from airmouse.lifecycle import Lifecycle
+    return Lifecycle(AppConfig(auto_exit_minutes=auto_exit_minutes,
+                               low_power_after_s=low_power_after_s))
+
+
+def test_low_power_throttles_inference_and_disables_control():
+    from airmouse.app import Controller
+    from airmouse.config import GestureConfig
+    from airmouse.gestures import GestureTracker
+
+    gestures = GestureTracker(GestureConfig())
+    gestures.enabled = True
+    ctrl = Controller(gestures, FakeMotion(), FakeMouse())
+    # 30 fps นาน 2 วิ ไม่มีมือเลย → low_power ที่ 0.3 วิ แล้วเหลือ ~6 fps
+    frames = [(_frame(), 1.0 + i / 30) for i in range(60)]
+    trk = CountingTracker()
+    t = InferenceThread(FakeCamera(frames), trk, False, False, ctrl,
+                        lifecycle=_lifecycle(), low_power_fps=6.0)
+    t.start()
+    assert _wait_for(lambda: t.latest() is not None and t.latest().ts >= frames[-6][1], 2.0)
+    t.stop()
+    t.join(timeout=1)
+    events = t.drain_events()
+    assert "paused" in events and "low_power" in events and "toggle_off" in events
+    assert not gestures.enabled
+    # ก่อน low_power ~9 เฟรม + หลังจากนั้น ~1.7 วิ × 6 fps ≈ 10 → ไม่ใช่ 60
+    assert len(trk.calls) < 30
+    assert t.latest().life.state == "low_power"
+
+
+def test_exit_event_reaches_main_thread_queue():
+    frames = [(_frame(), 1.0 + i * 0.1) for i in range(20)]
+    t = InferenceThread(FakeCamera(frames), FakeTracker(), False, False, None,
+                        lifecycle=_lifecycle(low_power_after_s=100, auto_exit_minutes=1 / 60))
+    t.start()
+    assert _wait_for(lambda: t.latest() is not None and t.latest().seq == 20, 2.0)
+    t.stop()
+    t.join(timeout=1)
+    assert t.drain_events().count("exit") == 1
+    assert t.drain_events() == []

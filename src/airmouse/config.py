@@ -61,9 +61,11 @@ class GestureConfig:
 
 @dataclass
 class AppConfig:
-    auto_exit_minutes: int = 10
+    auto_exit_minutes: float = 10.0
     low_power_after_s: float = 3.0
+    low_power_fps: float = 6.0
     sounds: bool = True
+    overlay: bool = True
 
 
 @dataclass

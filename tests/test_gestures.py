@@ -818,3 +818,128 @@ def test_scroll_holds_while_middle_cobends(fps):
     assert r.events() == ["scroll_start"] and r.states[-1].mode == "scroll"
     r.feed_n(NORMAL, 4)  # เหยียดทุกนิ้ว → จบ scroll
     assert r.events() == ["scroll_start", "scroll_end"]
+
+
+# ===================== Phase 4: disable() / request_toggle() =====================
+import threading  # noqa: E402
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_disable_mid_drag_ends_it_and_toggles_off(fps):
+    r = Rig(fps)
+    r.feed_n(PINCH, 5)
+    assert r.t.dragging
+    ev = r.t.disable()
+    assert ev == ["drag_end", "toggle_off"]
+    assert not r.t.enabled and not r.t.dragging
+    assert r.feed(PINCH).mode == "off"
+    assert r.events().count("drag_start") == 1  # ไม่เริ่มลากใหม่ตอนปิด
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_disable_mid_scroll(fps):
+    r = Rig(fps)
+    r.feed_n(SCROLL, 5)
+    assert r.t.scrolling
+    assert r.t.disable() == ["scroll_end", "toggle_off"]
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_disable_mid_clutch(fps):
+    r = Rig(fps)
+    r.feed_n(FIST, 5)
+    assert r.t.clutch
+    assert r.t.disable() == ["clutch_off", "toggle_off"]
+    assert not r.t.clutch
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_disable_when_already_off_emits_nothing(fps):
+    r = Rig(fps, enabled=False)
+    assert r.t.disable() == []
+    mine: list[str] = ["x"]
+    assert r.t.disable(mine) is mine and mine == ["x"]
+
+
+def test_disable_appends_to_given_list():
+    r = Rig(10)
+    r.feed_n(PINCH, 5)
+    ev = ["before"]
+    assert r.t.disable(ev) is ev
+    assert ev == ["before", "drag_end", "toggle_off"]
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_disable_clears_pending_click(fps):
+    r = Rig(fps)
+    r.feed_n(_g(idx=0.55, mid=0.60, pinch=0.04), 2)  # เพิ่งเข้าเกณฑ์คลิก (อาจรอยืนยัน)
+    r.t.disable()
+    r.t.request_toggle()
+    r.feed_n(NORMAL, 3)  # เปิดใหม่ ต้องไม่มีคลิกค้างเก่าโผล่
+    assert r.events().count("click_left") <= 1
+    assert "click_left" not in [e for s in r.states[-3:] for e in s.events]
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_disable_mid_flip_does_not_retoggle_while_flip_held(fps):
+    r = Rig(fps)
+    r.feed_for(_g(facing=FLIP_FACING), 0.3)  # กำลังพลิก ยังไม่ถึงเวลา toggle
+    assert r.states[-1].mode == "flip" and r.events() == []
+    assert r.t.disable() == ["toggle_off"]
+    r.feed_for(_g(facing=FLIP_FACING), 3.0)  # พลิกค้างต่อ
+    assert r.events() == []  # ไม่ toggle_on ซ้ำเอง
+    assert not r.t.enabled
+    r.feed_n(NORMAL, 3)  # พลิกกลับ → พร้อม toggle ครั้งใหม่
+    r.feed_for(_g(facing=FLIP_FACING), 1.2)
+    assert r.events() == ["toggle_on"]
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_request_toggle_from_other_thread_applies_next_update(fps):
+    r = Rig(fps, enabled=False)
+    done = threading.Event()
+
+    def worker():
+        r.t.request_toggle()
+        done.set()
+
+    th = threading.Thread(target=worker)
+    th.start()
+    th.join(2)
+    assert done.is_set()
+    assert not r.t.enabled  # ยังไม่เปลี่ยนจนกว่า update ถัดไป
+    st = r.feed(NORMAL)
+    assert st.events == ("toggle_on",) and st.enabled and st.mode == "move"
+    assert r.feed(NORMAL).events == ()  # ใช้ครั้งเดียว
+
+    th = threading.Thread(target=r.t.request_toggle)
+    th.start()
+    th.join(2)
+    st = r.feed(NORMAL)
+    assert st.events == ("toggle_off",) and not st.enabled and st.mode == "off"
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_request_toggle_off_ends_actions(fps):
+    r = Rig(fps)
+    r.feed_n(PINCH, 5)
+    r.t.request_toggle()
+    st = r.feed(PINCH)
+    assert st.events == ("drag_end", "toggle_off")
+    assert st.mode == "off"
+    assert r.t.dragging is False
+
+
+def test_request_toggle_applies_even_when_hand_lost():
+    r = Rig(10, enabled=False)
+    r.t.request_toggle()
+    st = r.t.update(None, r.ts + 0.1)
+    assert st.events == ("toggle_on",) and st.enabled
+
+
+def test_many_requests_before_update_collapse_to_one_toggle():
+    r = Rig(10, enabled=False)
+    for _ in range(3):
+        r.t.request_toggle()
+    st = r.feed(NORMAL)
+    assert st.events == ("toggle_on",)

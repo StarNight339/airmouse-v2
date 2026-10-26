@@ -8,6 +8,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import threading
+from collections.abc import Callable
 from ctypes import wintypes
 
 log = logging.getLogger(__name__)
@@ -143,3 +144,56 @@ def shutdown() -> None:
             winmm.timeEndPeriod(1)
         except Exception as e:  # noqa: BLE001
             log.warning("timeEndPeriod ไม่สำเร็จ: %s", e)
+
+
+# ---- console close handler ----
+CTRL_C_EVENT = 0
+CTRL_BREAK_EVENT = 1
+CTRL_CLOSE_EVENT = 2
+CTRL_LOGOFF_EVENT = 5
+CTRL_SHUTDOWN_EVENT = 6
+_CLOSE_EVENTS = (CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT)
+
+_HandlerRoutine = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+_console_cb: Callable[[], None] | None = None
+_console_routine: _HandlerRoutine | None = None  # ต้องถือ reference ไว้ไม่ให้โดน GC
+
+
+def _on_console_event(ctrl_type: int) -> bool:
+    """รันบน thread ที่ระบบสร้างให้ (ไม่ใช่ main thread) คืน False เสมอ = ให้ default handling ต่อ
+    Ctrl+C/Break ไม่ยุ่ง (Python จัดการ SIGINT เองอยู่แล้ว)"""
+    if ctrl_type in _CLOSE_EVENTS:
+        cb = _console_cb
+        if cb is not None:
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                log.exception("console close callback ผิดพลาด")
+    return False
+
+
+def install_console_close_handler(callback: Callable[[], None]) -> bool:
+    """เรียก callback เมื่อปิดหน้าต่าง console / logoff / shutdown (ให้ cleanup ปล่อยปุ่มเมาส์)
+    เรียกซ้ำได้ (แค่เปลี่ยน callback) คืน False ถ้าไม่มี console หรือ API ล้มเหลว
+    หมายเหตุ: callback ถูกเรียกจาก thread อื่น และระบบฆ่าโปรเซสหลังประมาณ 5 วินาที"""
+    global _console_cb, _console_routine
+    with _lock:
+        _console_cb = callback
+        if _console_routine is not None:
+            return True
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.SetConsoleCtrlHandler.argtypes = [_HandlerRoutine, wintypes.BOOL]
+            k32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+            routine = _HandlerRoutine(_on_console_event)
+            if not k32.SetConsoleCtrlHandler(routine, True):
+                log.warning("SetConsoleCtrlHandler ล้มเหลว (err=%d) อาจไม่มี console",
+                            ctypes.get_last_error())
+                _console_cb = None
+                return False
+            _console_routine = routine
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("ติดตั้ง console handler ไม่สำเร็จ: %s", e)
+            _console_cb = None
+            return False

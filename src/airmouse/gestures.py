@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import threading
 from collections import deque
 from dataclasses import dataclass
 
@@ -150,6 +151,9 @@ class GestureTracker:
         self._mid_bend: float | None = None
         self._pending: tuple[str, float, float] | None = None  # (event, bend_ts, deadline)
         self._pinch_hist: deque[float] = deque(maxlen=PINCH_MEDIAN_N)
+        # คำขอ toggle จากเธรดอื่น (เช่นเมนู tray) — ประมวลผลต้นรอบ update ถัดไป
+        self._req_lock = threading.Lock()
+        self._req_toggle = False
 
     @property
     def learning(self) -> bool:
@@ -221,9 +225,49 @@ class GestureTracker:
         elif (n - pos) / n >= LEARN_AGREE:
             self.normal_sign = -1
 
+    # ---- ควบคุมจากภายนอก (lifecycle / tray) ----
+    def _stop_control(self, events: list[str]) -> None:
+        """ปิดทุกอย่างที่ค้าง: drag/scroll/clutch และสถานะคลิก (รวมคลิกที่รอยืนยัน)"""
+        self._end_actions(events)
+        if self.clutch:
+            self.clutch = False
+            events.append("clutch_off")
+        self._fist_n = self._rel_n = 0
+        self._reset_click()
+
+    def _set_enabled(self, value: bool, events: list[str]) -> None:
+        if value == self.enabled:
+            return
+        if not value:
+            self._stop_control(events)
+        self.enabled = value
+        events.append("toggle_on" if value else "toggle_off")
+        # กำลังพลิกมืออยู่ตอนถูกสลับ → ต้องพลิกกลับก่อน ไม่งั้นจะ toggle ซ้ำทันที
+        self._flip_start = None
+        if self._flip_raw:
+            self._need_release = True
+
+    def disable(self, events: list[str] | None = None) -> list[str]:
+        """ปิดการควบคุม (เช่นเข้า low power) เรียกจากเธรดเดียวกับ update; คืน/ต่อ events"""
+        events = [] if events is None else events
+        if self.enabled:
+            self._set_enabled(False, events)
+        else:  # ปิดอยู่แล้ว: เก็บกวาดของค้างเฉย ๆ ไม่ส่ง toggle_off
+            self._stop_control(events)
+        return events
+
+    def request_toggle(self) -> None:
+        """thread-safe: ขอสลับ enabled ใช้ที่ต้นรอบ update ถัดไป"""
+        with self._req_lock:
+            self._req_toggle = True
+
     def update(self, feats: HandFeatures | None, ts: float) -> GestureState:
         cfg = self.cfg
         events: list[str] = []
+        with self._req_lock:
+            requested, self._req_toggle = self._req_toggle, False
+        if requested:
+            self._set_enabled(not self.enabled, events)
         if feats is None:
             self._lost(ts, events)
             return GestureState(self.enabled, False, 0.0, False, False, tuple(events),

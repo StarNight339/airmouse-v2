@@ -1,4 +1,4 @@
-"""python -m airmouse [--debug-view] [--debug] [--log-pose] [--config PATH]"""
+"""python -m airmouse [--debug-view] [--debug] [--stay] [--log-pose] [--config PATH]"""
 from __future__ import annotations
 
 import argparse
@@ -18,6 +18,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="เปิดหน้าต่างภาพกล้องพร้อม landmark, ค่า curl/pinch และ FPS")
     parser.add_argument("--debug", action="store_true",
                         help="บันทึก FPS, dt และเวลา inference ลง logs/")
+    parser.add_argument("--stay", action="store_true",
+                        help="ไม่ปิดโปรแกรมเองเมื่อไม่เห็นมือนาน (เฉพาะรอบนี้)")
     parser.add_argument("--log-pose", action="store_true",
                         help="บันทึกค่ามือ (curl, pinch, facing, mode) ทุกเฟรมลง log (ใช้กับ --debug)")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH,

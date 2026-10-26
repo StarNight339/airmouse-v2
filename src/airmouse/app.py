@@ -5,9 +5,11 @@ import argparse
 import atexit
 import json
 import logging
+import os
 import signal
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -21,6 +23,7 @@ from . import features
 from .camera import Camera
 from .features import HandFeatures
 from .gestures import GestureState, GestureTracker
+from .lifecycle import LifeState, Lifecycle
 from .motion import Motion
 from .timing import RateMeter
 from .tracker import HandTracker, TrackedHand, ensure_model
@@ -48,6 +51,7 @@ class FrameResult:
     target: tuple[float, float] | None = None  # ตำแหน่ง cursor เป้าหมาย (None = ไม่ได้ควบคุม)
     speed: float = 0.0
     gain: float = 0.0
+    life: LifeState | None = None
 
 
 class Controller:
@@ -186,7 +190,8 @@ class InferenceThread(threading.Thread):
     """รอเฟรมใหม่จากกล้อง → MediaPipe → features แล้วเก็บผลล่าสุดไว้ให้ UI อ่าน"""
 
     def __init__(self, camera: Camera, tracker: HandTracker, mirror: bool, debug: bool,
-                 controller: Controller | None = None, log_pose: bool = False):
+                 controller: Controller | None = None, log_pose: bool = False,
+                 lifecycle: Lifecycle | None = None, low_power_fps: float = 6.0):
         super().__init__(name="inference", daemon=True)
         self._camera = camera
         self._tracker = tracker
@@ -194,6 +199,9 @@ class InferenceThread(threading.Thread):
         self._mirror = mirror
         self._debug = debug
         self._log_pose = log_pose
+        self._lifecycle = lifecycle
+        self._low_power_dt = 1.0 / max(low_power_fps, 0.5)
+        self._events: deque[str] = deque(maxlen=200)  # event ให้ main thread (เสียง/tray)
         self._lock = threading.Lock()
         self._latest: FrameResult | None = None
         self._stop_event = threading.Event()
@@ -204,9 +212,18 @@ class InferenceThread(threading.Thread):
         with self._lock:
             return self._latest
 
+    def drain_events(self) -> list[str]:
+        """event ที่เกิดตั้งแต่เรียกครั้งก่อน (gesture + lifecycle) สำหรับ Qt main thread"""
+        out = []
+        while self._events:
+            out.append(self._events.popleft())
+        return out
+
     def run(self) -> None:
         seq = 0
         last_ts: float | None = None
+        low_power = False
+        last_processed = float("-inf")
         stats = _DebugStats(self._controller) if self._debug else None
         recorder = None
         if self._log_pose:
@@ -222,6 +239,10 @@ class InferenceThread(threading.Thread):
                 if got is None:
                     continue
                 seq, frame, ts = got
+                # ประหยัดพลังงาน: ข้ามเฟรมให้ inference เหลือ ~low_power_fps (ยังตรวจหามืออยู่)
+                if low_power and ts - last_processed < self._low_power_dt:
+                    continue
+                last_processed = ts
                 if self._mirror:
                     frame = cv2.flip(frame, 1)
                 t0 = time.perf_counter()
@@ -232,15 +253,26 @@ class InferenceThread(threading.Thread):
                     feats = features.compute(hand.landmarks, hand.world, w / h,
                                              hand.handedness, self._mirror)
                 infer_ms = (time.perf_counter() - t0) * 1000
-                gesture = target = None
+                gesture = target = life = None
                 speed = gain = 0.0
                 if self._controller is not None:
                     gesture, target = self._controller.step(feats, ts, w / h)
                     speed, gain = self._controller.motion.speed, self._controller.motion.gain
+                    self._events.extend(gesture.events)
+                if self._lifecycle is not None:
+                    life = self._lifecycle.update(hand is not None, ts)
+                    low_power = life.state == "low_power"
+                    if "low_power" in life.events and self._controller is not None:
+                        # กลับมาจากประหยัดพลังงานต้องพลิกมือเปิดใหม่ (PLAN ข้อ 5)
+                        self._events.extend(self._controller.gestures.disable())
+                        log.info("ไม่เห็นมือ %.0f วิ → ประหยัดพลังงาน", life.idle_s)
+                    if "exit" in life.events:
+                        log.info("ไม่เห็นมือ %.1f นาที → ปิดโปรแกรม", life.idle_s / 60)
+                    self._events.extend(life.events)
                 self.fps.tick(ts)
                 result = FrameResult(seq, frame, ts, hand, feats, infer_ms,
                                      self._camera.fps.rate, self.fps.rate,
-                                     gesture, target, speed, gain)
+                                     gesture, target, speed, gain, life)
                 with self._lock:
                     self._latest = result
                 if recorder is not None:
@@ -330,6 +362,102 @@ def _setup_logging(debug: bool) -> None:
     )
 
 
+EXIT_NOTIFY_MS = 2500  # แสดงแจ้งเตือน "ปิดแล้ว" ก่อนออกจริง
+
+
+class _AppUI:
+    """ส่วน Qt main thread: tray, overlay, เสียง, หน้าต่าง debug, auto-exit
+
+    อ่านผลล่าสุดและ event จาก InferenceThread ด้วย QTimer (ไม่แตะ Qt จาก thread อื่น)
+    """
+
+    def __init__(self, app: QApplication, cfg: config_mod.Config, args: argparse.Namespace,
+                 inference: InferenceThread, gestures: GestureTracker):
+        from .sound import Sounds
+        from .ui.cursor_overlay import CursorOverlay
+        from .ui.tray import Tray
+
+        self._app = app
+        self._cfg = cfg
+        self._args = args
+        self._inference = inference
+        self._gestures = gestures
+        self.exit_code = 0
+        self._exiting = False
+        self._status = ""
+        self._view = None
+        self._sounds = Sounds(cfg.app.sounds)
+        self._overlay = CursorOverlay() if cfg.app.overlay else None
+
+        self._tray = Tray()
+        self._tray.toggle_requested.connect(gestures.request_toggle)
+        self._tray.debug_requested.connect(self._show_debug)
+        self._tray.open_config_requested.connect(self._open_config)
+        self._tray.quit_requested.connect(app.quit)
+        self._tray.set_status("Air Mouse: ปิดการควบคุม (พลิกมือค้างเพื่อเปิด)", False)
+        self._tray.show()
+
+        if args.debug_view:
+            self._show_debug()
+            # เปิดมาพร้อม --debug-view: ปิดหน้าต่าง = ออกจากโปรแกรม (เหมือนเดิม)
+            self._view.closed.connect(app.quit)
+
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(16)
+
+    def _show_debug(self) -> None:
+        if self._view is None:
+            from .ui.debug_view import DebugView
+            self._view = DebugView(self._inference, self._cfg.gesture)
+        self._view.show()
+        self._view.raise_()
+        self._view.activateWindow()
+
+    def _open_config(self) -> None:
+        try:
+            os.startfile(self._args.config)  # type: ignore[attr-defined]  # Windows เท่านั้น
+        except OSError:
+            log.exception("เปิด config ไม่ได้")
+
+    def _tick(self) -> None:
+        for ev in self._inference.drain_events():
+            self._sounds.play(ev)
+            if ev == "exit" and not self._exiting:
+                self._exiting = True
+                self._tray.notify("Air Mouse ปิดแล้ว",
+                                  f"ไม่เห็นมือครบ {self._cfg.app.auto_exit_minutes:g} นาที")
+                QTimer.singleShot(EXIT_NOTIFY_MS, self._app.quit)
+        r = self._inference.latest()
+        g = r.gesture if r is not None else None
+        self._update_status(r, g)
+        if self._overlay is not None:
+            from .ui.cursor_overlay import overlay_progress
+            visible = g is not None and r.hand is not None and not self._exiting
+            self._overlay.set_state(g.mode if g else "off",
+                                    overlay_progress(g) if g else 0.0, visible)
+
+    def _update_status(self, r, g) -> None:  # noqa: ANN001
+        if g is None:
+            return
+        life = r.life.state if r.life is not None else "active"
+        if life == "low_power":
+            text = "Air Mouse: ประหยัดพลังงาน (ไม่เห็นมือ)"
+        elif g.enabled:
+            text = "Air Mouse: กำลังควบคุม"
+        else:
+            text = "Air Mouse: ปิดการควบคุม (พลิกมือค้างเพื่อเปิด)"
+        if text != self._status:
+            self._status = text
+            self._tray.set_status(text, g.enabled)
+
+    def close(self) -> None:
+        self._timer.stop()
+        if self._overlay is not None:
+            self._overlay.hide()
+        self._tray.hide()
+
+
 def run(args: argparse.Namespace) -> int:
     _setup_logging(args.debug)
     cfg = config_mod.load(args.config)
@@ -366,18 +494,23 @@ def run(args: argparse.Namespace) -> int:
         log.info("จอ (virtual desktop) %s | พลิกมือค้าง %d ms เพื่อเปิด/ปิดการควบคุม",
                  screen, cfg.gesture.toggle_hold_ms)
 
+        # ปิดหน้าต่าง terminal = Windows ฆ่าโปรเซสใน ~5 วิ → ปล่อยปุ่มเมาส์ก่อน (ห้ามแตะ Qt)
+        system.install_console_close_handler(lambda: (mouse.stop(), win_mouse.release_all()))
+
+        lifecycle = Lifecycle(cfg.app, stay=args.stay)
         inference = InferenceThread(camera, tracker, cfg.camera.mirror, args.debug, controller,
-                                    log_pose=args.log_pose)
+                                    log_pose=args.log_pose, lifecycle=lifecycle,
+                                    low_power_fps=cfg.app.low_power_fps)
         inference.start()
 
         app = QApplication.instance() or QApplication([])
-        exit_code = 0
+        app.setQuitOnLastWindowClosed(False)  # อยู่ใน tray; ปิดหน้าต่าง debug ไม่ได้แปลว่าออก
+        ui = _AppUI(app, cfg, args, inference, controller.gestures)
 
         def watchdog() -> None:
-            nonlocal exit_code
             if not inference.is_alive():
                 log.error("หยุดทำงาน: %s", inference.error or camera.error or "inference thread จบเอง")
-                exit_code = 1
+                ui.exit_code = 1
                 app.quit()
 
         # Ctrl+C ใน terminal: Qt ไม่คืน control ให้ Python ถ้าไม่มี timer ปลุกเป็นระยะ
@@ -385,18 +518,12 @@ def run(args: argparse.Namespace) -> int:
         timer = QTimer()
         timer.timeout.connect(watchdog)
         timer.start(200)
-
-        view = None
-        if args.debug_view:
-            from .ui.debug_view import DebugView
-            view = DebugView(inference, cfg.gesture)
-            view.show()
-        else:
-            log.info("กำลังติดตามมือ (กด Ctrl+C เพื่อออก)")
+        log.info("กำลังติดตามมือ (ไอคอนอยู่ใน system tray, กด Ctrl+C หรือเมนู ออก เพื่อปิด)")
 
         app.exec()
         timer.stop()
-        return exit_code
+        ui.close()
+        return ui.exit_code
     finally:
         if inference is not None:
             inference.stop()
