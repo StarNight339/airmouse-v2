@@ -96,3 +96,25 @@ def test_finder_inactive_makes_no_queries_and_stops():
     f.stop()
     f.join(2)
     assert not f.is_alive()
+
+
+def test_choose_child_containing_smallest():
+    rects = [(0, 0, 100, 100), (10, 10, 40, 40), (50, 50, 60, 60), (200, 200, 300, 300)]
+    assert T.choose_child_containing(rects, (20, 20)) == 1
+    assert T.choose_child_containing(rects, (55, 55)) == 2
+    assert T.choose_child_containing(rects, (90, 90)) == 0
+    assert T.choose_child_containing(rects, (150, 150)) is None
+    assert T.choose_child_containing([], (1, 1)) is None
+
+
+def test_choose_child_containing_ignores_empty_and_ties_pick_last():
+    assert T.choose_child_containing([(5, 5, 5, 5), (0, 0, 10, 10)], (5, 5)) == 1
+    assert T.choose_child_containing([(0, 0, 10, 10), (0, 0, 10, 10)], (5, 5)) == 1
+
+
+def test_same_app_by_pid_or_exe(monkeypatch):
+    monkeypatch.setattr(T, "_exe_name", lambda pid: {1: "a.exe", 2: "a.exe", 3: "b.exe", 4: ""}[pid])
+    assert T._same_app(1, 1)
+    assert T._same_app(1, 2)
+    assert not T._same_app(1, 3)
+    assert not T._same_app(4, 3)

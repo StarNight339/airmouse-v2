@@ -35,6 +35,9 @@ UIA_TIMEOUT_MS = 200
 UIA_FAIL_LIMIT = 5  # query UIA ล้มเหลวทั้งหมดติดกันกี่ครั้งถึงเลิกใช้ UIA
 RING_POINTS = 8
 MAX_ANCESTORS = 3
+MAX_DEPTH = 25
+DESCEND_BUDGET_S = 0.060
+TREE_SCOPE_CHILDREN = 2
 MIN_SIZE = 6.0
 MAX_W = 400.0
 MAX_H = 120.0
@@ -121,6 +124,22 @@ def dedupe(targets: list[Target]) -> list[Target]:
     return out
 
 
+def choose_child_containing(rects: list[tuple[float, float, float, float]],
+                            pt: tuple[float, float]) -> int | None:
+    """index ของ rect (l, t, r, b) ที่ครอบจุดและมีพื้นที่เล็กที่สุด (เท่ากันเลือกตัวหลังสุดซึ่งอยู่
+    บนสุดใน z-order ของ UIA) ข้าม rect ที่ไม่มีพื้นที่; ไม่มี -> None"""
+    best: int | None = None
+    best_area = math.inf
+    for i, (l, t, r, b) in enumerate(rects):
+        if r <= l or b <= t:
+            continue
+        if l <= pt[0] <= r and t <= pt[1] <= b:
+            area = (r - l) * (b - t)
+            if area <= best_area:
+                best, best_area = i, area
+    return best
+
+
 def ring_points(x: float, y: float, radius: float, n: int = RING_POINTS) -> list[tuple[int, int]]:
     """จุดค้นหา: ตัว cursor เอง + n จุดบนวงรัศมี"""
     pts = [(round(x), round(y))]
@@ -150,6 +169,69 @@ GA_ROOT = 2
 GWL_STYLE = -16
 WS_CAPTION = 0x00C00000
 DWMWA_CAPTION_BUTTON_BOUNDS = 5
+
+
+_user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetClassNameW.restype = ctypes.c_int
+# desktop: ไล่ลงแล้วช้ามาก (400 ms+) และไอคอนเดสก์ท็อปไม่ใช่เป้าหมายที่ต้องการ
+SKIP_ROOT_CLASSES = frozenset({"Progman", "WorkerW"})
+SLOW_DESCENT_S = 0.150   # descent ที่ใช้เวลานานกว่านี้ -> พัก root นั้น
+SLOW_ROOT_COOLDOWN_S = 5.0
+
+
+def _class_name(hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(128)
+    _user32.GetClassNameW(hwnd, buf, 128)
+    return buf.value
+
+
+def _root_window_at(x: int, y: int) -> tuple[int, int]:
+    """(root hwnd, pid) ของหน้าต่างจริงใต้จุด; WindowFromPoint ข้าม window ที่ click-through ให้"""
+    hwnd = _user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+    if not hwnd:
+        return 0, 0
+    root = _user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+    pid = wintypes.DWORD(0)
+    _user32.GetWindowThreadProcessId(root, ctypes.byref(pid))
+    return int(root), int(pid.value)
+
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                 ctypes.POINTER(wintypes.DWORD)]
+_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_exe_cache: dict[int, str] = {}
+
+
+def _exe_name(pid: int) -> str:
+    """ชื่อไฟล์ exe ของ pid (cache; ไม่รู้ -> "")"""
+    name = _exe_cache.get(pid)
+    if name is None:
+        name = ""
+        h = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if h:
+            buf = ctypes.create_unicode_buffer(520)
+            n = wintypes.DWORD(520)
+            if _kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                name = os.path.basename(buf.value).lower()
+            _kernel32.CloseHandle(h)
+        if len(_exe_cache) > 512:
+            _exe_cache.clear()
+        _exe_cache[pid] = name
+    return name
+
+
+def _same_app(pid_a: int, pid_b: int) -> bool:
+    """pid เดียวกัน หรือ exe เดียวกัน (แอป multi-process เช่น Chromium/Discord ที่ UIA ตอบจาก
+    process อื่นของแอปเดียวกัน) — ต่างกัน = element นั้นมาจาก overlay ของแอปอื่น"""
+    if pid_a == pid_b:
+        return True
+    a = _exe_name(pid_a)
+    return bool(a) and a == _exe_name(pid_b)
 
 
 def caption_targets_at(x: int, y: int, own_pid: int, search_px: float) -> list[Target]:
@@ -200,14 +282,26 @@ class _Uia:
         for pid in (_PROP_BOUNDS, _PROP_PID, _PROP_CTYPE, _PROP_NAME, _PROP_ENABLED, _PROP_OFFSCREEN):
             self.cache.AddProperty(pid)
         self.walker = self.uia.ControlViewWalker
+        self.true_cond = self.uia.CreateTrueCondition()
+        self._slow_roots: dict[int, float] = {}  # hwnd -> พักจนถึงเวลา
+        self.deadline = math.inf  # เวลา (perf_counter) ที่ต้องเลิกไล่ลงใน query นี้
 
     def target_at(self, x: int, y: int, own_pid: int,
                   memo: dict | None = None) -> Target | None:
-        """memo: cache ภายใน query เดียว (rect+type ของ element แรก -> ผลลัพธ์) กันไต่ parent ซ้ำ
-        เมื่อหลายจุดบนวงไปตกที่ element เดียวกัน (การไต่ parent คือส่วนที่แพงที่สุด)"""
+        """หาปุ่มที่ (x, y): ถาม WindowFromPoint (ข้าม window click-through ให้แล้ว) แล้วเทียบกับ
+        ElementFromPoint — ถ้า element เป็นของโปรเซสอื่น/ของเรา (overlay เต็มจอ เช่น NVIDIA,
+        Dynamic Island ที่ UIA มองทะลุ transparent ไม่ได้) ให้ไล่ลงจาก root hwnd จริงแทน
+        memo: cache ภายใน query เดียว (rect+type ของ element แรก -> ผลลัพธ์) กันไต่ parent ซ้ำ"""
+        root, root_pid = _root_window_at(x, y)
+        if root and root_pid == own_pid:
+            return None
+        if root and _class_name(root) in SKIP_ROOT_CLASSES:
+            return None
         el = self.uia.ElementFromPointBuildCache(wintypes.POINT(x, y), self.cache)
         if not el:
-            return None
+            return self._descend(root, x, y, own_pid) if root else None
+        if root and not _same_app(el.CachedProcessId, root_pid):
+            return self._descend(root, x, y, own_pid)
         r0 = el.CachedBoundingRectangle
         key = (r0.left, r0.top, r0.right, r0.bottom, el.CachedControlType)
         if memo is not None and key in memo:
@@ -217,22 +311,65 @@ class _Uia:
             memo[key] = res
         return res
 
+    def _judge(self, el, own_pid: int) -> tuple[bool, Target | None]:  # noqa: ANN001
+        """(ตัดสินแล้วไหม, ผล) — control ที่คลิกได้ตัวแรกเป็นตัวตัดสิน; element ใหญ่เกินก็หยุด"""
+        ctype = el.CachedControlType
+        r = el.CachedBoundingRectangle
+        w, h = r.right - r.left, r.bottom - r.top
+        if ctype in CONTROL_KINDS:
+            if keep_element(ctype, w, h, bool(el.CachedIsEnabled),
+                            bool(el.CachedIsOffscreen), el.CachedProcessId, own_pid):
+                return True, Target(r.left, r.top, r.right, r.bottom,
+                                    CONTROL_KINDS[ctype], el.CachedName or "")
+            return True, None
+        if w > MAX_W or h > MAX_H:
+            return True, None  # parent ย่อมใหญ่กว่านี้ ไม่ต้องไต่ต่อ
+        return False, None
+
     def _climb(self, el, own_pid: int) -> Target | None:  # noqa: ANN001
         for _ in range(MAX_ANCESTORS + 1):
             if not el:
                 return None
-            ctype = el.CachedControlType
-            r = el.CachedBoundingRectangle
-            w, h = r.right - r.left, r.bottom - r.top
-            if ctype in CONTROL_KINDS:
-                if keep_element(ctype, w, h, bool(el.CachedIsEnabled),
-                                bool(el.CachedIsOffscreen), el.CachedProcessId, own_pid):
-                    return Target(r.left, r.top, r.right, r.bottom,
-                                  CONTROL_KINDS[ctype], el.CachedName or "")
-                return None  # control ที่คลิกได้ตัวแรกไม่ผ่านเงื่อนไข: หยุด
-            if w > MAX_W or h > MAX_H:
-                return None  # parent ย่อมใหญ่กว่านี้ ไม่ต้องไต่ต่อ
+            done, res = self._judge(el, own_pid)
+            if done:
+                return res
             el = self.walker.GetParentElementBuildCache(el, self.cache)
+        return None
+
+    def _descend(self, hwnd: int, x: int, y: int, own_pid: int) -> Target | None:
+        """ไล่ลงจาก root hwnd ทีละชั้น เลือกลูกที่ครอบจุดและเล็กที่สุด จนไม่มีหรือลึกเกิน/หมดเวลา
+        แล้วไต่ขึ้นหา control ที่คลิกได้ด้วยกฎเดิม"""
+        now = time.perf_counter()
+        if self._slow_roots.get(hwnd, 0.0) > now or now > self.deadline:
+            return None
+        try:
+            el = self.uia.ElementFromHandleBuildCache(hwnd, self.cache)
+        except Exception:  # noqa: BLE001
+            return None
+        path = [el]
+        for _ in range(MAX_DEPTH):
+            if time.perf_counter() > self.deadline:
+                break
+            try:
+                kids = el.FindAllBuildCache(TREE_SCOPE_CHILDREN, self.true_cond, self.cache)
+            except Exception:  # noqa: BLE001
+                break  # element นี้ query ไม่ได้ (protected/ค้าง) ใช้เท่าที่ไล่มาแล้ว
+            n = kids.Length
+            rects = []
+            for i in range(n):
+                r = kids.GetElement(i).CachedBoundingRectangle
+                rects.append((r.left, r.top, r.right, r.bottom))
+            idx = choose_child_containing(rects, (x, y))
+            if idx is None:
+                break
+            el = kids.GetElement(idx)
+            path.append(el)
+        if time.perf_counter() - now > SLOW_DESCENT_S:
+            self._slow_roots[hwnd] = time.perf_counter() + SLOW_ROOT_COOLDOWN_S
+        for cand in reversed(path[-(MAX_ANCESTORS + 1):]):
+            done, res = self._judge(cand, own_pid)
+            if done:
+                return res
         return None
 
 
@@ -304,6 +441,7 @@ class TargetFinder(threading.Thread):
             fails = 0
             pts = ring_points(probe[0], probe[1], self._search_px)
             memo: dict = {}
+            uia.deadline = time.perf_counter() + DESCEND_BUDGET_S
             for px, py in pts:
                 try:
                     t = uia.target_at(px, py, self._own_pid, memo)
