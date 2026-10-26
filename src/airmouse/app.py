@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import json
 import logging
 import signal
 import threading
@@ -151,6 +152,36 @@ class Controller:
         return g, target
 
 
+class PoseRecorder:
+    """บันทึก landmark ทั้ง 21 จุดทุกเฟรมเป็น JSONL (--log-pose) ไว้ replay/จูนท่ามือทีหลัง
+
+    บรรทัดละเฟรม: t, aspect, mirror และถ้าเห็นมือ: hand, score, lm (พิกัดภาพ x,y,z),
+    world (เมตร) รวมถึง mode/ev ของ GestureTracker; เฟรมที่ไม่เห็นมือมี hand = null
+    """
+
+    def __init__(self, path):
+        self.path = path
+        # line-buffered: ปิดโปรแกรมแบบไม่ปกติ (kill/crash) ข้อมูลยังอยู่ครบถึงเฟรมล่าสุด
+        self._fh = open(path, "w", encoding="utf-8", buffering=1)
+
+    def write(self, ts: float, aspect: float, mirror: bool, hand: TrackedHand | None,
+              gesture: GestureState | None) -> None:
+        rec: dict = {"t": round(ts, 4), "aspect": round(aspect, 4), "mirror": mirror,
+                     "hand": None}
+        if hand is not None:
+            rec.update(
+                hand=hand.handedness, score=round(hand.score, 3),
+                lm=[[round(v, 4) for v in p] for p in hand.landmarks],
+                world=[[round(v, 5) for v in p] for p in hand.world],
+            )
+        if gesture is not None:
+            rec.update(mode=gesture.mode, ev=list(gesture.events))
+        self._fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+    def close(self) -> None:
+        self._fh.close()
+
+
 class InferenceThread(threading.Thread):
     """รอเฟรมใหม่จากกล้อง → MediaPipe → features แล้วเก็บผลล่าสุดไว้ให้ UI อ่าน"""
 
@@ -177,6 +208,12 @@ class InferenceThread(threading.Thread):
         seq = 0
         last_ts: float | None = None
         stats = _DebugStats(self._controller) if self._debug else None
+        recorder = None
+        if self._log_pose:
+            config_mod.LOGS_DIR.mkdir(exist_ok=True)
+            recorder = PoseRecorder(
+                config_mod.LOGS_DIR / f"airmouse-{datetime.now():%Y%m%d-%H%M%S}-pose.jsonl")
+            log.info("บันทึกตำแหน่งนิ้วทุกเฟรม: %s", recorder.path)
         try:
             while not self._stop_event.is_set():
                 if self._camera.error:
@@ -206,14 +243,19 @@ class InferenceThread(threading.Thread):
                                      gesture, target, speed, gain)
                 with self._lock:
                     self._latest = result
-                if self._log_pose and feats is not None:
-                    log.debug("pose t=%.3f %s", ts, _describe_pose(feats, gesture))
+                if recorder is not None:
+                    recorder.write(ts, w / h, self._mirror, hand, gesture)
+                    if feats is not None:
+                        log.debug("pose t=%.3f %s", ts, _describe_pose(feats, gesture))
                 if stats is not None:
                     stats.add(ts, None if last_ts is None else ts - last_ts, infer_ms, result)
                 last_ts = ts
         except Exception as exc:
             log.exception("inference thread error")
             self.error = str(exc)
+        finally:
+            if recorder is not None:
+                recorder.close()
 
     def stop(self) -> None:
         self._stop_event.set()

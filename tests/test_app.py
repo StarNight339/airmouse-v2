@@ -536,3 +536,48 @@ def test_flip_mode_freezes_cursor_and_resyncs_after():
     assert mouse.active == [True, False, False, True]
     assert len(mouse.targets) == 2   # ไม่ขยับระหว่างพลิก
     assert len(m.resets) == 2        # พลิกกลับแล้วตั้งต้นจาก cursor ใหม่
+
+
+# --- PoseRecorder (--log-pose) ---
+
+def test_pose_recorder_writes_jsonl_and_replays(tmp_path):
+    import json
+
+    from airmouse.app import PoseRecorder
+    from airmouse.gestures import GestureTracker
+    from airmouse.config import GestureConfig
+
+    hand = _hand()
+    rec = PoseRecorder(tmp_path / "p.jsonl")
+    g = GestureState(True, False, 0.0, False, False, events=("click_left",), mode="move")
+    rec.write(1.0, 4 / 3, True, hand, g)
+    rec.write(1.1, 4 / 3, True, None, None)
+    rec.close()
+    lines = [json.loads(x) for x in (tmp_path / "p.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 2
+    a, b = lines
+    assert a["hand"] == "right" and len(a["lm"]) == 21 and len(a["world"]) == 21
+    assert a["ev"] == ["click_left"] and a["mode"] == "move"
+    assert b["hand"] is None
+    # ค่าที่บันทึกต้องคำนวณ features ซ้ำได้ (ใช้ replay)
+    from airmouse import features
+    f = features.compute(a["lm"], a["world"], a["aspect"], a["hand"], a["mirror"])
+    ref = features.compute(hand.landmarks, hand.world, 4 / 3, "right", True)
+    assert f.pinch == pytest.approx(ref.pinch, abs=1e-4)
+    t = GestureTracker(GestureConfig())
+    t.update(f, a["t"])
+    t.update(None, b["t"])
+
+
+def test_inference_thread_records_pose_when_enabled(tmp_path, monkeypatch, run_thread):
+    from airmouse import config as config_mod
+    monkeypatch.setattr(config_mod, "LOGS_DIR", tmp_path)
+    cam = FakeCamera([(_frame(), 1.0), (_frame(), 1.1)])
+    t = InferenceThread(cam, FakeTracker(hands={0: _hand()}), False, False, log_pose=True)
+    t.start()
+    assert _wait_for(lambda: t.latest() is not None and t.latest().seq == 2)
+    t.stop()
+    t.join(timeout=1)
+    files = list(tmp_path.glob("*-pose.jsonl"))
+    assert len(files) == 1
+    assert len(files[0].read_text(encoding="utf-8").splitlines()) == 2
