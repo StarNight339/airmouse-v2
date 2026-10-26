@@ -44,6 +44,8 @@ class MotionConfig:
 class GestureConfig:
     curl_down: float = 0.70
     curl_up: float = 0.82
+    click_curl_down: float = 0.77
+    click_curl_up: float = 0.84
     pinch_down: float = 0.017
     pinch_up: float = 0.030
     confirm_frames: int = 2

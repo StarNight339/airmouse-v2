@@ -297,7 +297,7 @@ def test_click_needs_rearm_after_flip_back(fps):
     r.feed_n(_g(idx=0.4), 5)  # พลิกกลับมาโดยนิ้วชี้ยังพับ
     assert r.count("click_left") == 0
     r.feed_n(NORMAL, 3)
-    r.feed_n(_g(idx=0.4), 3)
+    r.feed_n(_g(idx=0.4), 6)  # confirm + ช่วงหน่วงกันกำมือ (CLICK_GUARD_S)
     assert r.count("click_left") == 1
 
 
@@ -330,7 +330,7 @@ def test_left_click_needs_rearm_after_drag(fps):
     r.feed_n(_g(idx=0.3), 6)  # ปล่อยจีบแต่ชี้ยังพับ
     assert r.events() == ["drag_start", "drag_end"]
     r.feed_n(NORMAL, 3)
-    r.feed_n(_g(idx=0.3), 3)
+    r.feed_n(_g(idx=0.3), 6)  # confirm + ช่วงหน่วงกันกำมือ
     assert r.count("click_left") == 1
 
 
@@ -406,7 +406,7 @@ def test_deliberate_middle_fold_gives_right_click(fps):
 @pytest.mark.parametrize("fps", FPS)
 def test_right_click_tolerates_small_ring_cobend_only(fps):
     r = Rig(fps)
-    r.feed_n(_g(mid=0.45, ring=0.85), 4)  # ring งอตามเล็กน้อย
+    r.feed_n(_g(mid=0.45, ring=0.85), 7)  # ring งอตามเล็กน้อย (รวมช่วงหน่วงกันกำมือ)
     assert r.events() == ["click_right"]
     r2 = Rig(fps)
     r2.feed_n(_g(mid=0.45, ring=0.6), 6)  # ring งอตามมาก = เหมือนกำมือ/ท่า scroll → ไม่คลิก
@@ -535,7 +535,7 @@ def test_hand_lost_resets_clutch_and_flip_hold(fps):
 
 def test_progress_fields():
     t = GestureTracker(GestureConfig())
-    st = t.update(_g(idx=0.76, mid=0.96, pinch=0.0235), 0.0)
+    st = t.update(_g(idx=0.805, mid=0.96, pinch=0.0235), 0.0)  # กึ่งกลาง click 0.77–0.84
     assert st.index_progress == pytest.approx(0.5)
     assert st.middle_progress == 0.0
     assert st.pinch_progress == pytest.approx(0.5)
@@ -576,7 +576,7 @@ def test_real_fist_samples_do_not_click(fps):
 def test_pinch_gate_for_click_and_drag_thresholds(fps):
     # ตอนพับชี้ ปลายนิ้วเข้าใกล้กัน (2.0–2.5 cm) ยังต้องคลิกได้และไม่ลาก
     r = Rig(fps)
-    r.feed_n(_g(idx=0.55, mid=0.62, pinch=0.021), 3)
+    r.feed_n(_g(idx=0.55, mid=0.62, pinch=0.021), 6)
     assert r.events() == ["click_left"]
     # 1.9 cm: ต่ำกว่า gate (pinch_down+0.003) ไม่คลิก แต่ยังไม่ถึงเกณฑ์ลาก (1.7 cm)
     r2 = Rig(fps)
@@ -720,3 +720,30 @@ def test_config_normal_facing_skips_learning(sign):
         ts += 0.1
         st = t.update(_g(facing=-0.72 * sign), ts)
     assert st.enabled and st.normal_sign == sign
+
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_comfortable_index_bend_clicks(fps):
+    # ค่าจริงจาก log: พับนิ้วชี้สบาย ๆ ได้ 0.72–0.74 (เดิมต้อง < 0.70 จึงไม่คลิก)
+    r = Rig(fps)
+    r.feed_n(_g(idx=0.73, mid=0.98, ring=0.99, pinky=0.96), 6)
+    assert r.events() == ["click_left"]
+
+
+@pytest.mark.parametrize("fps", FPS)
+def test_click_cancelled_when_fist_follows(fps):
+    # นิ้วชี้พับถึงเกณฑ์ก่อน แล้วนาง/ก้อยพับตามภายใน CLICK_GUARD_S = กำมือ → ไม่คลิก
+    r = Rig(fps)
+    r.feed_n(_g(idx=0.6, mid=0.95, ring=0.97, pinky=0.96), 2)
+    r.feed_n(_g(idx=0.5, mid=0.5, ring=0.6, pinky=0.6), 6)
+    assert "click_left" not in r.events()
+
+
+def test_stale_pending_click_dropped_after_frame_gap():
+    # คลิกยืนยันแล้วแต่เฟรมขาดหาย 1.5 วิ (กล้องค้าง) → ห้ามคลิกย้อนหลังตอนเฟรมกลับมา
+    r = Rig(10)
+    r.feed_n(_g(idx=0.74), 2)
+    r.ts += 1.5
+    r.feed_n(NORMAL, 2)
+    assert "click_left" not in r.events()

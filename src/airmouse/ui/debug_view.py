@@ -203,9 +203,13 @@ class DebugView(QWidget):
         text("curl  (1.0 = เหยียด)", MUTED, size=9)
         for name in FINGERS:
             v = f.curl[name]
-            color = RED if v < self._g.curl_down else (GREEN if v > self._g.curl_up else YELLOW)
-            self._bar(p, x, y - 12, bar_w, v, color,
-                      (self._g.curl_down, self._g.curl_up), f"{name:<6} {v:.2f}")
+            # นิ้วชี้/กลาง: ขีดเกณฑ์คลิก; นิ้วอื่น: ขีดเกณฑ์กำมือ
+            if name in ("index", "middle"):
+                lo, hi = self._g.click_curl_down, self._g.click_curl_up
+            else:
+                lo, hi = self._g.curl_down, self._g.curl_up
+            color = RED if v < lo else (GREEN if v > hi else YELLOW)
+            self._bar(p, x, y - 12, bar_w, v, color, (lo, hi), f"{name:<6} {v:.2f}")
             y += 26
         y += 8
 

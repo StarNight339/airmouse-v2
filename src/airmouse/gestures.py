@@ -17,6 +17,9 @@ LEARN_MIN_SAMPLES = 10  # ต้องมีตัวอย่างอย่า
 LEARN_MIN_SPAN_S = 1.5  # ต้องสังเกตมาอย่างน้อยเท่านี้ (กันพลิกค้างสั้น ๆ ตอนเริ่มถูกนับเป็นด้านปกติ)
 LEARN_AGREE = 0.8      # ต้องเห็นด้านเดียวกันอย่างน้อยเท่านี้ของตัวอย่าง
 LEARN_MIN_FACING = 0.4  # เฟรมที่ |facing| ต่ำกว่านี้ไม่ใช้เรียนรู้
+CLICK_GUARD_S = 0.1   # หน่วงคลิกเท่านี้ ถ้านิ้วนาง/ก้อยพับตาม (กำมือ) ระหว่างนั้น → ยกเลิก
+CLICK_STALE_S = 0.3   # เฟรมถัดไปมาช้ากว่ากำหนดเกินนี้ (กล้องค้าง) → ทิ้งคลิกที่รอ; 10 fps ปกติช้า ~0.1 s
+CLICK_RP_GUARD = 0.88  # ค่าเฉลี่ย curl นาง+ก้อยต่ำกว่านี้ระหว่างหน่วง = กำลังกำมือ
 CLICK_PINCH_MARGIN = 0.003  # คลิกต้อง pinch > pinch_down + margin (ไม่ใช่ pinch_up)
 
 
@@ -53,13 +56,13 @@ def is_scroll_pose(c: dict[str, float], cfg: GestureConfig) -> bool:
 
 def is_click_left(c: dict[str, float], pinch: float, cfg: GestureConfig) -> bool:
     """ชี้พับนำ (ชี้ <= กลาง; กลางพับตามได้) โดยนางกับก้อยยังเหยียด (ไม่ใช่กำมือ)"""
-    return (c["index"] < cfg.curl_down and c["index"] <= c["middle"]
+    return (c["index"] < cfg.click_curl_down and c["index"] <= c["middle"]
             and _rp_mean(c) > cfg.scroll_curl_max
             and pinch > cfg.pinch_down + CLICK_PINCH_MARGIN)
 
 
 def is_click_right(c: dict[str, float], pinch: float, cfg: GestureConfig) -> bool:
-    return (c["middle"] < cfg.curl_down and c["index"] > cfg.curl_up
+    return (c["middle"] < cfg.click_curl_down and c["index"] > cfg.curl_up
             and _rp_mean(c) > cfg.scroll_curl_max
             and pinch > cfg.pinch_down + CLICK_PINCH_MARGIN)
 
@@ -132,6 +135,7 @@ class GestureTracker:
         self._mid_n = 0
         self._idx_bend: float | None = None
         self._mid_bend: float | None = None
+        self._pending: tuple[str, float, float] | None = None  # (event, bend_ts, deadline)
 
     @property
     def learning(self) -> bool:
@@ -141,6 +145,7 @@ class GestureTracker:
         self._idx_armed = self._mid_armed = False
         self._idx_n = self._mid_n = 0
         self._idx_bend = self._mid_bend = None
+        self._pending = None
 
     def _end_actions(self, events: list[str]) -> None:
         """ปิด drag/scroll ทันที (มือหาย/ปิดระบบ/พลิกมือ) เพื่อไม่ให้ปุ่มค้าง"""
@@ -246,9 +251,9 @@ class GestureTracker:
 
         idx, mid, ring, pinky = four
         pinch = feats.pinch
-        span = cfg.curl_up - cfg.curl_down
-        idx_prog = _clamp01((cfg.curl_up - idx) / span)
-        mid_prog = _clamp01((cfg.curl_up - mid) / span)
+        span = cfg.click_curl_up - cfg.click_curl_down
+        idx_prog = _clamp01((cfg.click_curl_up - idx) / span)
+        mid_prog = _clamp01((cfg.click_curl_up - mid) / span)
         pinch_prog = _clamp01((cfg.pinch_up - pinch) / (cfg.pinch_up - cfg.pinch_down))
 
         click_ts: float | None = None
@@ -358,13 +363,13 @@ class GestureTracker:
         เงื่อนไขท่าอยู่ใน is_click_left / is_click_right (ชุดเดียวกับ raw_pose)"""
         cfg = self.cfg
         idx, mid = c["index"], c["middle"]
-        # armed + เวลาที่เริ่มพับ
-        if idx > cfg.curl_up:
+        # armed + เวลาที่เริ่มพับ (เกณฑ์คลิกแยกจากเกณฑ์กำมือ: พับนิ้วแค่ ~0.77 ก็พอ ไม่ปวดมือ)
+        if idx > cfg.click_curl_up:
             self._idx_armed = True
             self._idx_bend = None
         elif self._idx_armed and self._idx_bend is None:
             self._idx_bend = ts
-        if mid > cfg.curl_up:
+        if mid > cfg.click_curl_up:
             self._mid_armed = True
             self._mid_bend = None
         elif self._mid_armed and self._mid_bend is None:
@@ -374,16 +379,25 @@ class GestureTracker:
         self._idx_n = self._idx_n + 1 if left else 0
         self._mid_n = self._mid_n + 1 if right else 0
 
+        # คลิกที่ยืนยันแล้วรอ CLICK_GUARD_S ก่อนส่ง: กำมือที่นิ้วชี้นำจะมีนาง/ก้อยพับตามมา
+        if self._pending is not None:
+            name, bend, deadline = self._pending
+            if _rp_mean(c) < CLICK_RP_GUARD or ts - deadline > CLICK_STALE_S:
+                # กลายเป็นกำมือ หรือเฟรมขาดหาย (กล้องค้าง) จนคลิกค้างเก่าเกิน → ยกเลิก
+                self._pending = None
+            elif ts >= deadline:
+                self._pending = None
+                events.append(name)
+                return bend
+            return None
         if self._idx_armed and self._idx_n >= cfg.confirm_frames:
             bend = self._idx_bend if self._idx_bend is not None else ts
             self._idx_armed = False
             self._idx_n = 0
-            events.append("click_left")
-            return bend
-        if self._mid_armed and self._mid_n >= cfg.confirm_frames:
+            self._pending = ("click_left", bend, ts + CLICK_GUARD_S)
+        elif self._mid_armed and self._mid_n >= cfg.confirm_frames:
             bend = self._mid_bend if self._mid_bend is not None else ts
             self._mid_armed = False
             self._mid_n = 0
-            events.append("click_right")
-            return bend
+            self._pending = ("click_right", bend, ts + CLICK_GUARD_S)
         return None
