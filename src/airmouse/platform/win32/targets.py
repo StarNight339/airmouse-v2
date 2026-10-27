@@ -142,12 +142,18 @@ def choose_child_containing(rects: list[tuple[float, float, float, float]],
     return best
 
 
-def ring_points(x: float, y: float, radius: float, n: int = RING_POINTS) -> list[tuple[int, int]]:
-    """จุดค้นหา: ตัว cursor เอง + n จุดบนวงรัศมี"""
+def ring_points(x: float, y: float, radius: float, n: int = RING_POINTS,
+                inner: float | None = None) -> list[tuple[int, int]]:
+    """จุดค้นหา: ตัว cursor เอง + n จุดบนวงรัศมี (+ n จุดบนวงใน ถ้าให้ inner)
+    วงในเหลื่อมมุมครึ่งช่อง: ปุ่มเล็กที่ห่าง 24–40 px ตกระหว่าง cursor กับวงนอกจะได้เจอ"""
     pts = [(round(x), round(y))]
-    for i in range(n):
-        a = 2 * math.pi * i / n
-        pts.append((round(x + radius * math.cos(a)), round(y + radius * math.sin(a))))
+    rings = [(radius, 0.0)]
+    if inner is not None and 0 < inner < radius:
+        rings.append((inner, math.pi / n))
+    for r, phase in rings:
+        for i in range(n):
+            a = 2 * math.pi * i / n + phase
+            pts.append((round(x + r * math.cos(a)), round(y + r * math.sin(a))))
     return pts
 
 
@@ -412,9 +418,11 @@ class UiaBackoff:
 
 
 class TargetFinder(threading.Thread):
-    def __init__(self, search_px: float = 48.0, use_uia: bool = True, hz: float = 12.0) -> None:
+    def __init__(self, search_px: float = 48.0, use_uia: bool = True, hz: float = 12.0,
+                 capture_px: float = 24.0) -> None:
         super().__init__(name="targets", daemon=True)
         self._search_px = float(search_px)
+        self._inner_px = float(capture_px)  # รัศมีวงค้นหาด้านใน = ระยะที่ snap เริ่มเกาะ
         self._use_uia = use_uia
         self._period = 1.0 / hz
         self._lock = threading.Lock()
@@ -442,6 +450,8 @@ class TargetFinder(threading.Thread):
             self._active_evt.clear()
             with self._lock:
                 self._targets = []
+            # กลับมา active ที่จุดเดิมภายใน REUSE_S ต้อง query ใหม่ ไม่งั้นได้รายการว่างที่เพิ่งล้าง
+            self._last_q = (None, 0.0)
 
     @property
     def targets(self) -> list[Target]:
@@ -477,7 +487,7 @@ class TargetFinder(threading.Thread):
         uia_failed = False
         if uia is not None:
             fails = 0
-            pts = ring_points(probe[0], probe[1], self._search_px)
+            pts = ring_points(probe[0], probe[1], self._search_px, inner=self._inner_px)
             memo: dict = {}
             uia.deadline = time.perf_counter() + DESCEND_BUDGET_S
             for px, py in pts:

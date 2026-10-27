@@ -398,6 +398,12 @@ class _DebugStats:
                 ms = self._controller.mouse.stats
                 mouse = " | mouse dt avg=%.1f max=%.1f ms late=%d" % (
                     ms["dt_avg_ms"], ms["dt_max_ms"], ms["late"])
+                finder = self._controller.finder
+                if finder is not None:
+                    fs = finder.stats
+                    if fs["queries"]:
+                        mouse += " | snap q=%d avg=%.1f max=%.1f ms" % (
+                            fs["queries"], fs["avg_ms"], fs["max_ms"])
             g = r.gesture
             state = "-" if g is None else g.mode
             log.debug(
@@ -580,7 +586,8 @@ def run(args: argparse.Namespace) -> int:
         mouse.start()
         from .platform.win32.targets import TargetFinder
         from .snap import Snapper
-        finder = TargetFinder(search_px=cfg.snap.search_px, use_uia=cfg.snap.uia)
+        finder = TargetFinder(search_px=cfg.snap.search_px, use_uia=cfg.snap.uia,
+                              capture_px=cfg.snap.capture_px)
         finder.start()
         screen = win_mouse.virtual_screen()
         motion = Motion(cfg.motion, screen, px_per_hand=win_mouse.primary_screen().h)

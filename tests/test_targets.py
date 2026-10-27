@@ -1,6 +1,7 @@
 """ทดสอบ pure helper ของ targets (ไม่ต้องใช้ COM)"""
 from __future__ import annotations
 
+import math
 import sys
 import time
 
@@ -66,6 +67,22 @@ def test_ring_points():
     pts = ring_points(100, 100, 48)
     assert len(pts) == 9 and pts[0] == (100, 100)
     assert (148, 100) in pts and (100, 148) in pts
+
+
+def test_ring_points_inner_ring_staggered():
+    pts = ring_points(100, 100, 48, inner=24)
+    assert len(pts) == 17 and pts[:9] == ring_points(100, 100, 48)
+    inner = pts[9:]
+    assert all(abs(math.dist(p, (100, 100)) - 24) < 1 for p in inner)
+    assert inner[0] == (122, 109)  # เริ่มที่ 22.5° (ครึ่งช่อง 45°) ไม่ซ้อนแนววงนอก
+    assert ring_points(100, 100, 48, inner=60) == ring_points(100, 100, 48)  # inner >= radius ไม่ใช้
+
+
+def test_set_active_false_forgets_last_query():
+    f = TargetFinder(use_uia=False)
+    f._last_q = ((10.0, 10.0), time.perf_counter())
+    f.set_active(False)
+    assert not f._is_fresh((10.0, 10.0), time.perf_counter())  # กลับมาต้อง query ใหม่
 
 
 def test_control_kinds_match_typelib():
