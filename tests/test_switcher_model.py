@@ -117,18 +117,38 @@ def test_remove_selected_next_slides_in():
     c = Carousel(5, start=2)
     _run(c, 0.0, 0.5)
     c.remove(2)
-    assert c.count == 4 and c.selected == 2
-    assert c.position == pytest.approx(2.0, abs=0.01)
+    # ไม่ teleport: การ์ดถัดไปไหลเข้ามาจากขวา (position ถอยหนึ่งการ์ดแล้วค่อยตามเป้า 2)
+    assert c.count == 4 and c.position == pytest.approx(1.0, abs=0.01)
+    assert c.target_index == 2
+    c.update(0.0, DT)
+    assert 1.0 < c.position < 2.0
     _run(c, 0.0, 0.5)
-    assert c.selected == 2
+    assert c.selected == 2 and c.position == pytest.approx(2.0, abs=0.01)
 
 
 def test_remove_selected_last_goes_to_previous():
     c = Carousel(4, start=3)
     _run(c, 0.0, 0.5)
     c.remove(3)
-    assert c.count == 3 and c.selected == 2
+    # position คงเดิม (3.0) ใบก่อนหน้าไหลเข้ามาเอง
+    assert c.count == 3 and c.position == pytest.approx(3.0, abs=0.01)
+    assert c.selected == 2 and c.target_index == 2
+    c.update(0.0, DT)
+    assert 2.0 < c.position < 3.0
+    _run(c, 0.0, 0.5)
     assert c.position == pytest.approx(2.0, abs=0.01)
+
+
+def test_target_index_follows_dx_immediately_without_rubber_band():
+    c = Carousel(5)               # base 1
+    assert c.target_index == 1
+    c.update(1.0, DT)             # position ยังแทบไม่ขยับ แต่ target_index ชี้การ์ดที่มือชี้แล้ว
+    assert c.selected == 1 and c.target_index == 2
+    c.update(10.0, DT)
+    assert c.target_index == 4    # clamp ไม่ใช้ rubber band
+    c.update(-10.0, DT)
+    assert c.target_index == 0
+    assert Carousel(0).target_index == 0
 
 
 def test_remove_after_selected_changes_nothing_visible():
@@ -144,7 +164,9 @@ def test_remove_keeps_hand_offset_continuous():
     _run(c, 1.0, 1.0)             # มือเลื่อน +1 → เลือก 2
     assert c.selected == 2
     c.remove(2)                   # การ์ด 3 เลื่อนเข้าช่อง 2
-    c.update(1.0, DT)             # dx เดิม (มือยังไม่ขยับ): ไม่กระโดด
+    c.update(1.0, DT)             # dx เดิม (มือยังไม่ขยับ): เป้ายังเป็นช่อง 2 ไม่กระโดดไปที่อื่น
+    assert c.target_index == 2
+    _run(c, 1.0, 1.0)
     assert c.selected == 2 and c.position == pytest.approx(2.0, abs=0.05)
     _run(c, 2.0, 1.0)             # มือเลื่อนต่ออีก 1 → การ์ดถัดไป
     assert c.selected == 3

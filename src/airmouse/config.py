@@ -106,6 +106,13 @@ _CHOICES = {
 }
 
 
+# ขอบล่างของค่าที่ใช้หาร/จับเวลา: (section, key) -> (ค่าต่ำสุด, ต้องมากกว่า (True) หรือเท่ากับก็ได้ (False))
+_MINIMA = {
+    ("gesture", "switcher_step"): (0.0, True),
+    ("gesture", "switcher_hold_ms"): (0, False),
+}
+
+
 def _coerce(section: str, f: dataclasses.Field, value):
     """แปลงชนิดค่าจากไฟล์ให้ตรงกับ field (int → float ได้, อย่างอื่นต้องตรง)"""
     default = f.default
@@ -123,6 +130,10 @@ def _coerce(section: str, f: dataclasses.Field, value):
     choices = _CHOICES.get((section, f.name))
     if choices and value not in choices:
         raise ValueError(f"[{section}] {f.name}: ต้องเป็นหนึ่งใน {choices} ได้ {value!r}")
+    low = _MINIMA.get((section, f.name))
+    if low is not None and not (value > low[0] if low[1] else value >= low[0]):
+        raise ValueError(f"[{section}] {f.name}: ต้อง{'มากกว่า' if low[1] else 'ไม่น้อยกว่า'} "
+                         f"{low[0]} ได้ {value!r}")
     return value
 
 

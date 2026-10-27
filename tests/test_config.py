@@ -37,6 +37,9 @@ def test_unknown_keys_are_ignored():
     {"camera": {"width": "640"}},
     {"camera": {"mirror": 1}},
     {"gesture": {"confirm_frames": 2.5}},
+    {"gesture": {"switcher_step": 0}},
+    {"gesture": {"switcher_step": -0.4}},
+    {"gesture": {"switcher_hold_ms": -1}},
 ])
 def test_invalid_values_raise(data):
     with pytest.raises(ValueError):

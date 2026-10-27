@@ -42,7 +42,9 @@ SWITCHER_FIST_PINKY_MARGIN = 0.10  # กำมือจริงเพื่อ 
 SWITCHER_OPEN_POSE_FRAC = 0.6   # เปิดได้ต่อเมื่อเฟรมในช่วง hold เป็นท่า 3 นิ้ว (gap > gap_on) อย่างน้อยเท่านี้
 SWITCHER_FLIP_CANCEL_S = 0.25   # switcher เปิดอยู่: พลิกมือยืนยันค้างเท่านี้จึงยกเลิก (สะบัดทำข้อมือบิดสั้น ๆ)
 SWITCHER_SWIPE_SETTLE_S = 0.5   # หลังสะบัดย่อ: พักการตรวจ commit เท่านี้ (นิ้วดูเหมือนมือปกติระหว่างสะบัด)
-SWITCHER_HAND_EMA = 0.1        # EMA ของขนาดมือ (ทำสเกลระยะเลื่อนให้นิ่ง)
+SWITCHER_LOST_S = 0.3           # switcher เปิดอยู่: มือหายนานเท่านี้จึงยกเลิก (dropout สั้น ๆ ไม่ทำให้เสียตำแหน่ง)
+SWITCHER_MIN_STEP = 1e-3        # กันหารศูนย์ถ้า switcher_step ผิดค่า
+SWITCHER_HAND_EMA = 0.1       # EMA ของขนาดมือ (ทำสเกลระยะเลื่อนให้นิ่ง)
 
 
 def _clamp01(v: float) -> float:
@@ -168,6 +170,7 @@ class GestureTracker:
         self._sw_exit_start: float | None = None
         self._sw_exit_n = 0
         self._sw_win: deque[tuple[float, bool]] = deque()  # (ts, is_switcher_pose) ในช่วง hold ล่าสุด
+        self._sw_last_dx = 0.0    # dx ล่าสุด (ตรึงไว้ตอนมือหายสั้น ๆ)
         self._sw_flip_t: float | None = None  # เริ่มพลิกมือ (ขณะ switcher เปิด)
         self._sw_flip_defer = False  # พลิกยังไม่ครบ SWITCHER_FLIP_CANCEL_S: ยังไม่ยกเลิก
         self._sw_armed = True     # สะบัดได้ครั้งเดียวต่อหนึ่งการสะบัด
@@ -218,15 +221,17 @@ class GestureTracker:
         self._idx_bend = self._mid_bend = None
         self._pending = None
 
-    def _end_actions(self, events: list[str]) -> None:
-        """ปิด drag/scroll ทันที (มือหาย/ปิดระบบ/พลิกมือ) เพื่อไม่ให้ปุ่มค้าง"""
+    def _end_actions(self, events: list[str], keep_switcher: bool = False) -> None:
+        """ปิด drag/scroll ทันที (มือหาย/ปิดระบบ/พลิกมือ) เพื่อไม่ให้ปุ่มค้าง
+        keep_switcher: มือหายสั้น ๆ — คง switcher ที่เปิดอยู่ไว้ (ยกเลิกเมื่อหายเกิน SWITCHER_LOST_S)"""
         if self.dragging:
             self.dragging = False
             events.append("drag_end")
         if self.scrolling:
             self.scrolling = False
             events.append("scroll_end")
-        self._sw_close(events, "switcher_cancel")  # ปิด switcher แบบยกเลิก (ครั้งเดียว)
+        if not keep_switcher:
+            self._sw_close(events, "switcher_cancel")  # ปิด switcher แบบยกเลิก (ครั้งเดียว)
         self._sw_enter_t = None  # ที่นับค้างท่าเพื่อเปิดอยู่ก็ล้าง
         self._sw_pose_n = self._sw_low_n = 0
         self._sw_win.clear()
@@ -263,10 +268,17 @@ class GestureTracker:
         if self.clutch:
             self.clutch = False
             events.append("clutch_off")
-        self._end_actions(events)
+        # switcher: มือหาย 1–2 เฟรม (dropout) ต้องไม่ยกเลิก; หายนาน >= SWITCHER_LOST_S จึงยกเลิก
+        gone = ts - self._lost_since
+        keep = self.switcher_open and self.enabled and 0 <= gone < SWITCHER_LOST_S
+        self._end_actions(events, keep_switcher=keep)
         self._reset_click()
-        # มือหาย = ปล่อยท่าแล้ว (เปิด switcher ใหม่ได้เมื่อค้างท่าครบ) และล้างตัวนับเข้าท่า
-        self._sw_need_release = False
+        if keep:
+            self._sw_exit_n = 0
+            self._sw_exit_start = None
+        # มือหายนาน = ปล่อยท่าแล้ว (เปิด switcher ใหม่ได้เมื่อค้างท่าครบ) และล้างตัวนับเข้าท่า
+        if gone >= SWITCHER_LOST_S or gone < 0:
+            self._sw_need_release = False
         self._sw_rel_n = 0
         self._sw_enter_t = None
         self._sw_pose_n = self._sw_low_n = 0
@@ -341,9 +353,13 @@ class GestureTracker:
             self._lost(ts, events)
             return GestureState(self.enabled, False, 0.0, False, False, tuple(events),
                                 mode=self._mode(), normal_sign=self.normal_sign,
-                                learning=self.learning)
+                                learning=self.learning,
+                                switcher_dx=self._sw_last_dx if self.switcher_open else 0.0)
 
         if self._lost_since is not None:
+            if self.switcher_open:  # กลับมาหลังหายสั้น ๆ: วัดความเร็ว/ตัวจับเวลาใหม่
+                self._sw_hist.clear()
+                self._sw_last_pose = ts
             gone = ts - self._lost_since
             if gone >= LOST_RELEASE_S:  # หายนานพอ ถือว่าพลิกกลับแล้ว
                 self._need_release = False
@@ -405,7 +421,13 @@ class GestureTracker:
             fist = False
         elif flip_raw and not self._sw_flip_defer:
             # กำลังพลิกข้อมือ: anchor เลื่อนเพราะการหมุน → ตัด drag/scroll, ไม่เริ่มอะไรใหม่, ไม่คลิก
+            was_open = self.switcher_open
             self._end_actions(events)
+            if was_open:
+                # พลิกมือยกเลิก switcher แล้ว: ต้องพลิกใหม่จึงจะ toggle (ไม่ให้ตัวจับเวลา toggle ค้างต่อ)
+                self._need_release = True
+                self._flip_start = None
+                progress = 0.0
             self._fist_n = self._rel_n = 0
             self._reset_click()
             fist = self.clutch
@@ -413,6 +435,7 @@ class GestureTracker:
             # switcher เปิดอยู่: ไม่ประมวลผลคลิก/drag/clutch/scroll เลย
             fist = False
             sw_dx = self._update_switcher(feats, ts, aspect, events)
+            self._sw_last_dx = sw_dx
         else:
             self._update_drag(pinch, events)
             self._update_clutch(c, fist_raw, events)
@@ -513,6 +536,7 @@ class GestureTracker:
         self._sw_pose_n = self._sw_low_n = 0
         self._sw_x0 = feats.anchor[0] * aspect
         self._sw_size = feats.hand_size if feats.hand_size > 0 else 0.2
+        self._sw_last_dx = 0.0
         self._sw_hist.clear()
         self._sw_hist.append((ts, self._sw_x0, feats.anchor[1]))
         self._sw_last_pose = ts
@@ -523,8 +547,12 @@ class GestureTracker:
         self._sw_swipe_dir = 0
         self._sw_swipe_ts = -1e9
 
+    @property
+    def _sw_step(self) -> float:
+        return max(self.cfg.switcher_step, SWITCHER_MIN_STEP)
+
     def _sw_dx_of(self, xa: float) -> float:
-        return (xa - self._sw_x0) / (self.cfg.switcher_step * self._sw_size)
+        return (xa - self._sw_x0) / (self._sw_step * max(self._sw_size, 1e-6))
 
     def _update_switcher(self, feats: HandFeatures, ts: float, aspect: float,
                          events: list[str]) -> float:
@@ -547,7 +575,7 @@ class GestureTracker:
             hist.popleft()
         if self._sw_freeze is not None:
             # ระหว่างสะบัดย่อ (จนมือนิ่ง) ตรึง dx ไว้ที่ค่าก่อนสะบัด x ที่ลอยจะไม่ขยับ carousel
-            self._sw_x0 = xa - self._sw_freeze * cfg.switcher_step * self._sw_size
+            self._sw_x0 = xa - self._sw_freeze * self._sw_step * self._sw_size
 
         # --- สะบัดขึ้น = ย่อการ์ด, สะบัดลง = ยกเลิก ---
         t0, x0a, y0 = hist[0]
@@ -575,15 +603,16 @@ class GestureTracker:
                         events.append("switcher_minimize")
                         # คงระยะเลื่อนเดิมก่อนสะบัด (dx ของต้นหน้าต่าง) ไม่ให้ x ที่ลอยตอนสะบัดขยับ carousel
                         prev_dx = self._sw_dx_of(x0a)
-                        self._sw_x0 = xa - prev_dx * cfg.switcher_step * self._sw_size
+                        self._sw_x0 = xa - prev_dx * self._sw_step * self._sw_size
                         self._sw_freeze = prev_dx
                     else:
                         self._sw_close(events, "switcher_cancel")
                         return 0.0
 
         # --- เลิกท่า → commit (เหมือนปล่อยปุ่ม Alt) ---
-        if moving or ts - self._sw_swipe_ts < SWITCHER_SWIPE_SETTLE_S:
-            # ระหว่างสะบัด/หลังสะบัดนิ้วดูเหมือนมือปกติ → ไม่ commit; ตัวนับทั้งหมดเริ่มใหม่หลังนิ่ง
+        if moving or self._flip_raw or ts - self._sw_swipe_ts < SWITCHER_SWIPE_SETTLE_S:
+            # ระหว่างสะบัด/หลังสะบัด/กำลังพลิกมือ (รอยืนยันยกเลิก) นิ้วดูเหมือนมือปกติ → ไม่ commit;
+            # ตัวนับทั้งหมดเริ่มใหม่หลังนิ่ง
             self._sw_exit_n = 0
             self._sw_exit_start = None
             self._sw_last_pose = ts

@@ -50,6 +50,14 @@ def test_far_cards_fade():
     assert cards[4][4] == 0.0 and cards[9][4] == 0.0
 
 
+def test_x_overlap():
+    from airmouse.ui.switcher import x_overlap
+    a = (0.0, 0.0, 10.0, 5.0, 1.0)
+    assert x_overlap(a, (5.0, 0.0, 10.0, 5.0, 1.0))
+    assert not x_overlap(a, (10.0, 0.0, 10.0, 5.0, 1.0))  # ขอบชน = ไม่ซ้อน
+    assert not x_overlap(a, (20.0, 0.0, 5.0, 5.0, 1.0))
+
+
 def test_fit_rect_aspect():
     x, y, w, h = fit_rect(1920, 1080, 0, 0, 200, 200)
     assert w == pytest.approx(200) and h == pytest.approx(200 * 1080 / 1920)

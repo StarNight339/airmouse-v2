@@ -112,7 +112,7 @@ class Controller:
 
     def step(self, feats: HandFeatures | None, ts: float, aspect: float
              ) -> tuple[GestureState, tuple[float, float] | None]:
-        g = self.gestures.update(feats, ts)
+        g = self.gestures.update(feats, ts, aspect)
         dt = DEFAULT_DT if self._last_ts is None else ts - self._last_ts
         self._last_ts = ts
         # จอถูกเสียบ/ถอดหรือเปลี่ยนความละเอียดได้ระหว่างใช้งาน
@@ -126,8 +126,9 @@ class Controller:
         user_busy = ts - self._user_ts < USER_GRACE_S
         # flip: กำลังพลิกมือ (เปิด/ปิด) → cursor ต้องไม่ตามการหมุนข้อมือ; พลิกกลับแล้ว
         # _was_active เป็น False จึง reset จากตำแหน่ง cursor ไม่กระโดด
-        active = (feats is not None and g.enabled and g.mode not in ("clutch", "flip")
-                  and not user_busy)
+        # switcher: มือใช้เลื่อนการ์ด cursor นิ่งอยู่ (ปิด switcher แล้วเริ่มจากตำแหน่ง cursor จริง)
+        active = (feats is not None and g.enabled
+                  and g.mode not in ("clutch", "flip", "switcher") and not user_busy)
         events = set(g.events)
         target = None
         if not active or "drag_end" in events:
@@ -236,6 +237,7 @@ class PoseRecorder:
     world (เมตร) รวมถึง mode/ev ของ GestureTracker; เฟรมที่ไม่เห็นมือมี hand = null
     เฟรมที่คุม cursor: cur (ตำแหน่งที่แสดง), spd (ความเร็วมือ hand-size/s) และตอน snap:
     virt (ตำแหน่ง virtual), snap (กรอบปุ่มที่เกาะ left, top, right, bottom)
+    เฟรมที่ switcher เปิด: sw (switcher_dx หน่วยการ์ด)
     """
 
     def __init__(self, path):
@@ -279,6 +281,8 @@ class InferenceThread(threading.Thread):
         self._lifecycle = lifecycle
         self._low_power_dt = 1.0 / max(low_power_fps, 0.5)
         self._events: deque[str] = deque(maxlen=200)  # event ให้ main thread (เสียง/tray)
+        # event ของ switcher พร้อม switcher_dx ของเฟรมเดียวกัน (ย่อ/เลือกต้องใช้ dx เฟรมนั้น)
+        self._sw_events: deque[tuple[str, float]] = deque(maxlen=50)
         self._lock = threading.Lock()
         self._latest: FrameResult | None = None
         self._stop_event = threading.Event()
@@ -295,6 +299,19 @@ class InferenceThread(threading.Thread):
         while self._events:
             out.append(self._events.popleft())
         return out
+
+    def drain_switcher_events(self) -> list[tuple[str, float]]:
+        """event switcher_* พร้อม switcher_dx ของเฟรมที่เกิด สำหรับ Qt main thread"""
+        out = []
+        while self._sw_events:
+            out.append(self._sw_events.popleft())
+        return out
+
+    def _emit(self, events, dx: float = 0.0) -> None:  # noqa: ANN001
+        self._events.extend(events)
+        for ev in events:
+            if ev.startswith("switcher_"):
+                self._sw_events.append((ev, dx))
 
     def run(self) -> None:
         seq = 0
@@ -335,18 +352,20 @@ class InferenceThread(threading.Thread):
                 if self._controller is not None:
                     gesture, target = self._controller.step(feats, ts, w / h)
                     speed, gain = self._controller.motion.speed, self._controller.motion.gain
-                    self._events.extend(gesture.events)
+                    self._emit(gesture.events, gesture.switcher_dx)
                 if self._lifecycle is not None:
                     life = self._lifecycle.update(hand is not None, ts)
                     low_power = life.state == "low_power"
                     if "low_power" in life.events and self._controller is not None:
                         # กลับมาจากประหยัดพลังงานต้องพลิกมือเปิดใหม่ (PLAN ข้อ 5)
-                        self._events.extend(self._controller.gestures.disable())
+                        self._emit(self._controller.gestures.disable())
                         log.info("ไม่เห็นมือ %.0f วิ → ประหยัดพลังงาน", life.idle_s)
                     if "exit" in life.events:
                         log.info("ไม่เห็นมือ %.1f นาที → ปิดโปรแกรม", life.idle_s / 60)
                         if self._controller is not None:  # ระหว่างรอปิด ห้ามเปิดควบคุมใหม่
-                            self._controller.gestures.disable()
+                            # ส่งต่อเฉพาะ switcher_cancel (ปิด UI) ไม่เล่นเสียง toggle_off ซ้อนเสียงปิด
+                            self._emit([e for e in self._controller.gestures.disable()
+                                        if e.startswith("switcher_")])
                     self._events.extend(life.events)
                 self.fps.tick(ts)
                 snap = self._controller.hovered if self._controller is not None else None
@@ -356,8 +375,10 @@ class InferenceThread(threading.Thread):
                 with self._lock:
                     self._latest = result
                 if recorder is not None:
-                    recorder.write(ts, w / h, self._mirror, hand, gesture,
-                                   _cursor_record(self._controller, target, speed))
+                    extra = _cursor_record(self._controller, target, speed)
+                    if gesture is not None and gesture.mode == "switcher":
+                        extra = {"sw": round(gesture.switcher_dx, 3)}  # ไว้จูน switcher_step
+                    recorder.write(ts, w / h, self._mirror, hand, gesture, extra)
                     if feats is not None:
                         log.debug("pose t=%.3f %s", ts, _describe_pose(feats, gesture))
                 if stats is not None:
@@ -454,6 +475,104 @@ def _setup_logging(debug: bool) -> None:
 EXIT_NOTIFY_MS = 2500  # แสดงแจ้งเตือน "ปิดแล้ว" ก่อนออกจริง
 
 
+SWITCHER_STALE_S = 1.0  # switcher เปิดอยู่แต่ไม่มีผลเฟรมใหม่นานเท่านี้ (กล้องค้าง) → ปิดเอง
+
+
+class _SwitcherUI:
+    """ฝั่ง Qt ของ Swipe Switcher: รายการหน้าต่าง + Carousel + SwitcherWindow (main thread เท่านั้น)
+
+    gestures บอกแค่ event กับ switcher_dx; ที่นี่ตัดสินว่าการ์ดไหนถูกเลือก/ย่อ แล้วสั่ง Windows
+    """
+
+    def __init__(self, preview: bool, win32=None, window=None) -> None:  # noqa: ANN001
+        # win32/window ส่งของปลอมได้ในเทสต์ (ห้ามเปิดหน้าต่าง/สลับ foreground จริง)
+        from .switcher_model import Carousel
+
+        if win32 is None:
+            from .platform.win32 import windows as win32
+        if window is None:
+            from .ui.switcher import SwitcherWindow
+            window = SwitcherWindow(preview=preview)
+        self._win32 = win32
+        self._carousel_cls = Carousel
+        self._window = window
+        self._carousel = None
+        self._wins: list = []
+        self._last_t: float | None = None
+        self._seq: int | None = None
+        self._seq_t = 0.0
+
+    @property
+    def is_open(self) -> bool:
+        return self._carousel is not None
+
+    def handle(self, ev: str, dx: float, now: float) -> None:
+        if ev == "switcher_open":
+            self._open(now)
+            return
+        if self._carousel is None:
+            return
+        # ใช้ dx ของเฟรมที่เกิด event และ target_index (ไม่ใช่ตำแหน่งที่ยัง smooth อยู่)
+        self._carousel.update(dx, 0.0)
+        idx = self._carousel.target_index
+        if ev == "switcher_minimize":
+            hwnd = self._wins[idx].hwnd
+            self._win32.minimize(hwnd)
+            del self._wins[idx]
+            self._carousel.remove(idx)
+            self._window.animate_remove(idx)
+            log.info("switcher: ย่อ %s", hwnd)
+            if not self._wins:
+                self.close()
+        elif ev == "switcher_commit":
+            info = self._wins[idx]
+            self.close()  # ปิด thumbnail ก่อนสลับ
+            log.info("switcher: สลับไป %s (%s)", info.title, info.exe)
+            # activate อาจรอ (Alt + ตรวจผล ~30 ms) → ไม่ทำบน UI thread
+            threading.Thread(target=self._win32.activate, args=(info.hwnd,),
+                             name="activate", daemon=True).start()
+        elif ev == "switcher_cancel":
+            self.close()
+
+    def _open(self, now: float) -> None:
+        self.close()
+        try:
+            wins = self._win32.list_switch_windows(os.getpid())
+        except Exception:  # noqa: BLE001
+            log.exception("switcher: อ่านรายการหน้าต่างไม่ได้")
+            return
+        if len(wins) < 2:
+            log.info("switcher: มีหน้าต่างให้สลับ %d บาน ไม่เปิด", len(wins))
+            return
+        self._wins = wins
+        self._carousel = self._carousel_cls(len(wins))
+        self._last_t = now
+        self._seq_t = now
+        self._window.open(wins, self._carousel.position)
+        self._window.set_position(self._carousel.position, self._carousel.selected)
+        log.info("switcher: เปิด %d หน้าต่าง", len(wins))
+
+    def tick(self, dx: float, seq: int | None, now: float) -> None:
+        if self._carousel is None:
+            return
+        if seq != self._seq:
+            self._seq, self._seq_t = seq, now
+        elif now - self._seq_t > SWITCHER_STALE_S:
+            log.warning("switcher: ไม่มีเฟรมใหม่ %.1f วิ → ปิด", now - self._seq_t)
+            self.close()
+            return
+        dt = now - (self._last_t if self._last_t is not None else now)
+        self._last_t = now
+        self._carousel.update(dx, dt)
+        self._window.set_position(self._carousel.position, self._carousel.selected)
+
+    def close(self) -> None:
+        if self._carousel is not None or self._window.is_open:
+            self._window.close_switcher()
+        self._carousel = None
+        self._wins = []
+
+
 class _AppUI:
     """ส่วน Qt main thread: tray, overlay, เสียง, หน้าต่าง debug, auto-exit
 
@@ -478,6 +597,7 @@ class _AppUI:
         self._view = None
         self._sounds = Sounds(cfg.app.sounds)
         self._overlay = CursorOverlay() if cfg.app.overlay else None
+        self._switcher = _SwitcherUI(cfg.switcher.preview) if cfg.switcher.enabled else None
 
         self._tray = Tray()
         self._tray.toggle_requested.connect(gestures.request_toggle)
@@ -526,10 +646,20 @@ class _AppUI:
                 QTimer.singleShot(EXIT_NOTIFY_MS, self._app.quit)
         r = self._inference.latest()
         g = r.gesture if r is not None else None
+        sw_open = False
+        if self._switcher is not None:
+            now = time.monotonic()
+            for ev, dx in self._inference.drain_switcher_events():
+                self._switcher.handle(ev, dx, now)
+            self._switcher.tick(g.switcher_dx if g is not None else 0.0,
+                                r.seq if r is not None else None, now)
+            sw_open = self._switcher.is_open
         self._update_status(r, g)
         if self._overlay is not None:
             from .ui.cursor_overlay import overlay_progress
-            visible = g is not None and r.hand is not None and not self._exiting
+            # switcher เปิด: ซ่อนวง cursor (PLAN ข้อ 6)
+            visible = (g is not None and r.hand is not None and not self._exiting
+                       and not sw_open)
             self._overlay.set_state(g.mode if g else "off",
                                     overlay_progress(g) if g else 0.0, visible,
                                     snapped=r is not None and r.snap is not None)
@@ -550,6 +680,8 @@ class _AppUI:
 
     def close(self) -> None:
         self._timer.stop()
+        if self._switcher is not None:
+            self._switcher.close()  # unregister DWM thumbnail ทั้งหมดก่อนออก
         if self._overlay is not None:
             self._overlay.hide()
         self._tray.hide()
@@ -591,7 +723,8 @@ def run(args: argparse.Namespace) -> int:
         finder.start()
         screen = win_mouse.virtual_screen()
         motion = Motion(cfg.motion, screen, px_per_hand=win_mouse.primary_screen().h)
-        controller = Controller(GestureTracker(cfg.gesture), motion, mouse,
+        gestures = GestureTracker(cfg.gesture, switcher_enabled=cfg.switcher.enabled)
+        controller = Controller(gestures, motion, mouse,
                                 click_rollback_s=cfg.motion.click_rollback_ms / 1000,
                                 double_click=win_mouse.double_click_metrics(),
                                 snapper=Snapper(cfg.snap), finder=finder)

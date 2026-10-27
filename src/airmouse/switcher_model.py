@@ -35,6 +35,16 @@ class Carousel:
             return 0
         return min(max(int(math.floor(self.position + 0.5)), 0), self.count - 1)
 
+    @property
+    def target_index(self) -> int:
+        """การ์ดที่มือชี้ "ตอนนี้" = round(clamp(base + dx ล่าสุด)) ไม่ผ่าน rubber band และไม่ผ่านการตามแบบหน่วง
+        UI ใช้ค่านี้ตอนย่อ (minimize) และ commit — เรียก update(dx, dt) ด้วย dx ของเฟรมเดียวกันก่อนเสมอ
+        (`selected` มาจาก position ที่หน่วง จึงอาจชี้การ์ดข้างเคียงระหว่างสะบัด)"""
+        if self.count <= 0:
+            return 0
+        raw = self._base + self._dx
+        return min(max(int(math.floor(raw + 0.5)), 0), self.count - 1)
+
     def _rubber(self, raw: float) -> float:
         hi = max(self.count - 1, 0)
         if raw < 0:
@@ -69,7 +79,7 @@ class Carousel:
         """การ์ด index ถูกย่อ/ปิด: ปรับให้การ์ดที่เลือกอยู่ยังดูต่อเนื่อง ไม่กระโดด"""
         if self.count <= 0 or not 0 <= index < self.count:
             return
-        sel = self.selected
+        sel = self.target_index
         self.count -= 1
         if self.count == 0:
             self.position = 0.0
@@ -81,14 +91,14 @@ class Carousel:
             new_sel = sel - 1
             self.position -= 1.0       # ดัชนีทั้งหมดเลื่อนลง ภาพต้องเลื่อนตามให้การ์ดเดิมอยู่ที่เดิม
         elif index == sel:
-            if sel < self.count:       # การ์ดถัดไปเลื่อนเข้าช่องเดิม
+            if sel < self.count:       # การ์ดถัดไปเลื่อนเข้าช่องเดิม: เริ่มจากขวา แล้วไหลเข้ากลาง
                 new_sel = sel
-            else:                      # เป็นใบสุดท้าย → ถอยไปใบก่อนหน้า
-                new_sel = self.count - 1
                 self.position -= 1.0
+            else:                      # เป็นใบสุดท้าย: position คงเดิม ใบก่อนหน้าไหลเข้ามาเอง
+                new_sel = self.count - 1
         else:
             new_sel = sel
-        self.position = min(max(self.position, -RUBBER_MAX), self.count - 1 + RUBBER_MAX)
+        # (กรณีใบสุดท้าย position อาจเกินปลายไป 1 การ์ด ตั้งใจให้ไหลกลับ — ไม่ clamp)
         # base + dx ปัจจุบัน = การ์ดที่เลือกใหม่ (dx ถัดไปที่ต่อเนื่องจะไม่ทำให้กระโดด)
         self._base = new_sel - self._dx
         self._ref = float(new_sel)

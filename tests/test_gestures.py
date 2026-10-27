@@ -1133,8 +1133,10 @@ def test_switcher_dx_uses_aspect_and_is_zero_when_closed():
     ts += r.dt
     st = r.t.update(_sw(x=0.56), ts, aspect=1.0)
     assert st.switcher_dx == pytest.approx(0.06 / (0.4 * 0.2), abs=0.01)
-    st = r.t.update(None, ts + r.dt)
-    assert st.switcher_dx == 0.0
+    st = r.t.update(None, ts + 0.5)  # ครั้งแรกที่หาย: ยังเปิด dx ตรึง
+    assert st.switcher_dx == pytest.approx(0.75, abs=0.01)
+    st = r.t.update(None, ts + 0.9)  # หายนาน → ยกเลิก dx = 0
+    assert st.switcher_dx == 0.0 and st.events == ("switcher_cancel",)
 
 
 @pytest.mark.parametrize("fps", SW_FPS)
@@ -1261,10 +1263,14 @@ def test_switcher_no_commit_right_after_minimize_swipe_then_commit_when_settled(
 def test_switcher_hand_lost_cancels_once_and_reopens_after_rehold():
     r = Rig(30)
     _open_switcher(r)
-    st = r.t.update(None, r.ts + 0.1)
+    t0 = r.ts
+    st = r.t.update(None, t0 + 0.1)
+    assert st.events == () and st.mode == "switcher"  # dropout สั้น: ยังเปิดอยู่
+    assert r.t.update(None, t0 + 0.2).events == ()
+    st = r.t.update(None, t0 + 0.45)  # หายเกิน 0.3 s
     assert st.events == ("switcher_cancel",) and st.mode == "move"
-    assert r.t.update(None, r.ts + 0.2).events == ()
-    r.ts += 0.3
+    assert r.t.update(None, t0 + 0.6).events == ()  # ไม่ซ้ำ
+    r.ts = t0 + 0.7
     r.feed_for(SW, 0.2)
     assert r.count("switcher_open") == 0
     r.feed_for(SW, 0.3)
@@ -1383,3 +1389,55 @@ def test_switcher_mode_blocks_clicks_and_clutch():
     r.feed_for(SW, 0.2)
     assert [e for e in r.events() if e.startswith(("click", "clutch", "drag", "scroll"))] == []
     assert r.states[-1].mode == "switcher"
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_single_dropped_frame_keeps_open_and_freezes_dx(fps):
+    r = Rig(fps)
+    _open_switcher(r)
+    st = r.feed_for(_sw(x=0.56), 0.4)
+    assert st.switcher_dx == pytest.approx(1.0, abs=0.01)
+    r.ts += r.dt
+    st = r.t.update(None, r.ts)  # มือหาย 1 เฟรม
+    assert st.events == () and st.mode == "switcher"
+    assert st.switcher_dx == pytest.approx(1.0, abs=0.01)  # ตรึงค่าล่าสุด
+    st = r.feed_for(_sw(x=0.56), 0.5)
+    assert st.switcher_dx == pytest.approx(1.0, abs=0.02)
+    assert _sw_events(r) == [] and r.states[-1].mode == "switcher"
+    # หายนาน 0.35 s → ยกเลิกครั้งเดียว
+    t = r.ts
+    evs = []
+    for k in range(1, 12):
+        evs += list(r.t.update(None, t + 0.035 * k).events)
+    assert evs == ["switcher_cancel"]
+
+
+def test_switcher_short_loss_keeps_need_release():
+    r = Rig(30)
+    _open_switcher(r, y=0.3)
+    _stroke(r, 0.3, +1)  # swipe down = cancel ขณะยังทำท่าอยู่
+    assert _sw_events(r) == ["switcher_cancel"]
+    r.ts += r.dt
+    r.t.update(None, r.ts)  # หายสั้น ๆ ไม่ล้างเงื่อนไข "ต้องปล่อยท่า"
+    r.feed_for(_sw(y=0.7), 1.0)
+    assert _sw_events(r) == ["switcher_cancel"]
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_flip_with_open_hand_cancels_not_commits(fps):
+    r = Rig(fps)
+    _open_switcher(r)
+    r.feed_for(_sw(pinky=0.95, facing=r.flip), 0.6)  # พลิกมือกางปกติ
+    assert _sw_events(r) == ["switcher_cancel"]
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_flip_cancel_does_not_continue_to_toggle(fps):
+    r = Rig(fps)
+    _open_switcher(r)
+    r.feed_for(_sw(facing=r.flip), 1.2)  # ค้าง > toggle_hold_ms
+    assert r.events() == ["switcher_cancel"] and r.states[-1].enabled
+    # พลิกใหม่ครั้งใหม่ toggle ได้ตามปกติ
+    r.feed_n(_g(facing=r.normal), 3)
+    r.feed_for(_g(facing=r.flip), 1.0)
+    assert r.events() == ["switcher_cancel", "toggle_off"]

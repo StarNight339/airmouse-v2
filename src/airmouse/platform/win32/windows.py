@@ -26,8 +26,15 @@ WS_EX_NOACTIVATE = 0x08000000
 GW_OWNER = 4
 GA_ROOT = 2
 DWMWA_CLOAKED = 14
-SW_MINIMIZE = 6
+SW_SHOWMINNOACTIVE = 7  # ย่อโดยไม่ activate หน้าต่างอื่น (ยกเลิก/ย่อแล้ว foreground เดิมต้องไม่เปลี่ยน)
 SW_RESTORE = 9
+VK_UNASSIGNED = 0xE8  # VK ที่ไม่ได้ผูกกับอะไร ใช้คั่น Alt กันถูกมองเป็นการกด Alt เดี่ยว (เปิดเมนู/KeyTips)
+INPUT_MARKER = 0x41495231  # dwExtraInfo ของ input ที่เราฉีดเอง ("AIR1")
+WS_EX_LAYERED = 0x00080000
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWCP_ROUND = 2
+RETRY_STEPS = 3
+RETRY_WAIT_S = 0.05
 WM_GETICON = 0x007F
 ICON_SMALL = 0
 ICON_BIG = 1
@@ -82,6 +89,14 @@ def is_switch_candidate(visible: bool, owner: int, ex_style: int, cloaked: int, 
     return True
 
 
+def build_alt_sequence() -> list[tuple[int, int]]:
+    """ลำดับ (vk, flags) ที่ส่งในครั้งเดียวเพื่อ "ปลด foreground lock":
+    Alt down -> VK ว่าง down+up -> Alt up. มีปุ่มอื่นคั่น ระบบจึงไม่ถือเป็นการกด Alt เดี่ยว
+    (ซึ่งจะเปิด menu bar/KeyTips) และจบด้วย Alt up เสมอ"""
+    return [(VK_MENU, 0), (VK_UNASSIGNED, 0), (VK_UNASSIGNED, KEYEVENTF_KEYUP),
+            (VK_MENU, KEYEVENTF_KEYUP)]
+
+
 if sys.platform == "win32":
     from .mouse import INPUT  # struct เดียวกับที่ใช้ส่งเมาส์
 
@@ -132,6 +147,11 @@ if sys.platform == "win32":
     _user32.BringWindowToTop.restype = wintypes.BOOL
     _user32.ShowWindow.argtypes = [_H, ctypes.c_int]
     _user32.ShowWindow.restype = wintypes.BOOL
+    # ShowWindowAsync ไม่บล็อกเมื่อแอปปลายทางค้าง (ShowWindow จะรอ message loop ของเขา)
+    _user32.ShowWindowAsync.argtypes = [_H, ctypes.c_int]
+    _user32.ShowWindowAsync.restype = wintypes.BOOL
+    _user32.IsHungAppWindow.argtypes = [_H]
+    _user32.IsHungAppWindow.restype = wintypes.BOOL
     _user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
     _user32.AttachThreadInput.restype = wintypes.BOOL
     _user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
@@ -163,6 +183,8 @@ if sys.platform == "win32":
     _dwm.DwmGetWindowAttribute.restype = ctypes.c_long
     _dwm.DwmRegisterThumbnail.argtypes = [_H, _H, ctypes.POINTER(_H)]
     _dwm.DwmRegisterThumbnail.restype = ctypes.c_long
+    _dwm.DwmSetWindowAttribute.argtypes = [_H, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    _dwm.DwmSetWindowAttribute.restype = ctypes.c_long
     _dwm.DwmUnregisterThumbnail.argtypes = [_H]
     _dwm.DwmUnregisterThumbnail.restype = ctypes.c_long
     _dwm.DwmUpdateThumbnailProperties.argtypes = [_H, ctypes.POINTER(_DWM_THUMBNAIL_PROPERTIES)]
@@ -372,14 +394,24 @@ def _root(hwnd: int) -> int:
 
 
 def _tap_alt() -> None:
-    """กด-ปล่อย Alt หนึ่งครั้ง: ทำให้โปรเซสเรา "เพิ่งมี input ล่าสุด" ผ่านกฎ foreground lock
-    ของ Windows แล้ว SetForegroundWindow จึงจะสำเร็จ"""
-    arr = (INPUT * 2)()
-    for i, flags in enumerate((0, KEYEVENTF_KEYUP)):
+    """ฉีด input ให้โปรเซสเรา "เพิ่งมี input ล่าสุด" ผ่านกฎ foreground lock ของ Windows
+    ส่งทั้ง 4 event ในการเรียกเดียว (ดู build_alt_sequence); ถ้าส่งไม่ครบแต่ Alt down ไปแล้ว
+    ส่ง Alt up แยกอีกครั้งเพื่อไม่ให้ Alt ค้าง"""
+    seq = build_alt_sequence()
+    arr = (INPUT * len(seq))()
+    for i, (vk, flags) in enumerate(seq):
         arr[i].type = INPUT_KEYBOARD
-        arr[i].ki.wVk = VK_MENU
+        arr[i].ki.wVk = vk
         arr[i].ki.dwFlags = flags
-    _user32.SendInput(2, arr, ctypes.sizeof(INPUT))
+        arr[i].ki.dwExtraInfo = INPUT_MARKER
+    n = _user32.SendInput(len(seq), arr, ctypes.sizeof(INPUT))
+    if 0 < n < len(seq):
+        up = (INPUT * 1)()
+        up[0].type = INPUT_KEYBOARD
+        up[0].ki.wVk = VK_MENU
+        up[0].ki.dwFlags = KEYEVENTF_KEYUP
+        up[0].ki.dwExtraInfo = INPUT_MARKER
+        _user32.SendInput(1, up, ctypes.sizeof(INPUT))
 
 
 def _is_fg(hwnd: int) -> bool:
@@ -392,15 +424,17 @@ def activate(hwnd: int) -> bool:
     if sys.platform != "win32":
         return False
     try:
-        if _user32.IsIconic(hwnd):
-            _user32.ShowWindow(hwnd, SW_RESTORE)
-        _tap_alt()
-        _user32.SetForegroundWindow(hwnd)
         if _is_fg(hwnd):
-            return True
-        time.sleep(0.03)
-        if _is_fg(hwnd):  # บางแอปใช้เวลาเปลี่ยนสถานะเล็กน้อย
-            return True
+            return True  # เป็น foreground อยู่แล้ว: ไม่ต้องฉีด input (กัน Alt เปิดเมนูของแอป)
+        if _user32.IsIconic(hwnd):
+            _user32.ShowWindowAsync(hwnd, SW_RESTORE)  # async: แอปค้างก็ไม่บล็อกเรา
+        _tap_alt()
+        # restore แบบ async อาจยังไม่เสร็จตอนเรียก SetForegroundWindow -> ลองซ้ำสั้นๆ
+        for _ in range(RETRY_STEPS):
+            _user32.SetForegroundWindow(hwnd)
+            if _is_fg(hwnd):
+                return True
+            time.sleep(RETRY_WAIT_S)
         # fallback: ผูก input queue กับ thread ของ foreground ปัจจุบันชั่วคราว
         fg = foreground()
         fg_tid = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
@@ -409,7 +443,8 @@ def activate(hwnd: int) -> bool:
         try:
             if fg_tid and fg_tid != cur_tid:
                 attached = bool(_user32.AttachThreadInput(cur_tid, fg_tid, True))
-            _user32.BringWindowToTop(hwnd)
+            if not _user32.IsHungAppWindow(hwnd):  # BringWindowToTop บล็อกถ้าแอปค้าง
+                _user32.BringWindowToTop(hwnd)
             _user32.SetForegroundWindow(hwnd)
         finally:
             if attached:
@@ -426,6 +461,29 @@ def minimize(hwnd: int) -> None:
     if sys.platform != "win32":
         return
     try:
-        _user32.ShowWindow(hwnd, SW_MINIMIZE)
+        # async + NOACTIVE: ไม่บล็อกถ้าแอปค้าง และไม่ดัน activation ไปหน้าต่างอื่น
+        _user32.ShowWindowAsync(hwnd, SW_SHOWMINNOACTIVE)
     except Exception:  # noqa: BLE001
         log.warning("minimize ผิดพลาด (hwnd=%s)", hwnd, exc_info=True)
+
+
+def is_layered(hwnd: int) -> bool:
+    """หน้าต่างมี WS_EX_LAYERED หรือไม่ (DWM thumbnail ไม่แสดงบนหน้าต่าง layered)"""
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(_user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def set_round_corners(hwnd: int) -> bool:
+    """Win11: ขอให้ DWM ตัดมุมมน (DWMWCP_ROUND); Win10 ไม่รองรับ -> คืน False ปล่อยเป็นสี่เหลี่ยม"""
+    if sys.platform != "win32":
+        return False
+    try:
+        v = ctypes.c_int(DWMWCP_ROUND)
+        return _dwm.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                                          ctypes.byref(v), ctypes.sizeof(v)) == 0
+    except Exception:  # noqa: BLE001
+        return False

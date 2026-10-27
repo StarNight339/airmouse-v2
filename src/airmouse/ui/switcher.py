@@ -79,6 +79,12 @@ def fit_rect(src_w: float, src_h: float, bx: float, by: float, bw: float, bh: fl
     return (bx + (bw - w) / 2, by + (bh - h) / 2, w, h)
 
 
+def x_overlap(a: tuple[float, float, float, float, float],
+              b: tuple[float, float, float, float, float]) -> bool:
+    """กรอบการ์ด (x, y, w, h, op) สองใบซ้อนกันในแนวนอนหรือไม่ (ขอบชนกันไม่นับ)"""
+    return a[0] < b[0] + b[2] and b[0] < a[0] + a[2]
+
+
 class _Card:
     __slots__ = ("info", "thumb", "src_size", "rect", "t")
 
@@ -105,7 +111,11 @@ class SwitcherWindow(QWidget):
             # (ไม่เป็นไรที่รับเมาส์ เพราะ NOACTIVATE ไม่แย่งโฟกัสอยู่แล้ว)
             flags |= Qt.WindowType.WindowTransparentForInput
         self.setWindowFlags(flags)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # preview=True: ไม่ใช้ WA_TranslucentBackground (Qt อาจทำให้หน้าต่างเป็น layered ซึ่ง
+        # DWM thumbnail ไม่แสดง) -> วาดพื้นทึบ + ขอมุมมนจาก DWM (Win11). preview=False: โปร่งแสงเดิม
+        self._translucent = not self._preview
+        if self._translucent:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._cards: list[_Card] = []
@@ -128,6 +138,10 @@ class SwitcherWindow(QWidget):
         วางกลางจอหลัก (primary) เสมอ — เรียบง่าย ไม่ต้องแปลงพิกัดจากหน้าต่าง foreground"""
         self.close_switcher()
         self._cards = [_Card(w) for w in windows]
+        # ล้าง cache ไอคอน (HWND อาจถูกนำกลับมาใช้ซ้ำ) และโหลดล่วงหน้าตอนนี้ ไม่ใช่ใน paintEvent
+        self._icons.clear()
+        for c in self._cards:
+            self._icon(c)
         self._position = float(position)
         self._selected = min(max(0, int(round(position))), max(0, len(self._cards) - 1))
         screen = QGuiApplication.primaryScreen()
@@ -139,6 +153,17 @@ class SwitcherWindow(QWidget):
             self.move(geo.x() + (geo.width() - w) // 2, geo.y() + (geo.height() - h) // 2)
         self._open = True
         self.show()  # showEvent ตั้ง ex style; winId ใช้ได้แล้ว
+        self._apply_win32()  # ซ้ำได้ไม่เสียหาย: กรณี native window ถูกสร้างใหม่
+        if sys.platform == "win32":
+            try:
+                from ..platform.win32 import windows as W
+                layered = W.is_layered(self._hwnd())
+                log.debug("switcher HWND layered=%s (preview=%s)", layered, self._preview)
+                if self._preview and layered:
+                    log.warning("switcher เป็น layered window — DWM thumbnail อาจไม่แสดง "
+                                "(ลอง SwitcherWindow(preview=False))")
+            except Exception:  # noqa: BLE001
+                log.debug("ตรวจ layered ไม่สำเร็จ", exc_info=True)
         if self._preview:
             for c in self._cards:
                 self._register(c)
@@ -177,6 +202,7 @@ class SwitcherWindow(QWidget):
             if anim in self._anims:
                 self._anims.remove(anim)
             anim.deleteLater()
+            self._relayout()  # แสดง thumbnail ที่ถูกซ่อนไว้คืน
             self.update()
 
         anim.valueChanged.connect(_step)
@@ -207,8 +233,7 @@ class SwitcherWindow(QWidget):
     # ---- ภายใน: Win32 ----
     def showEvent(self, event) -> None:  # noqa: ANN001, N802
         super().showEvent(event)
-        if not self._styled:
-            self._apply_win32()
+        self._apply_win32()  # ทุกครั้งที่แสดง (native window อาจถูกสร้างใหม่)
 
     def _hwnd(self) -> int:
         return int(self.winId())
@@ -233,6 +258,9 @@ class SwitcherWindow(QWidget):
                                 cur | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST)
             u.SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
             self._styled = True
+            if not self._translucent:
+                from ..platform.win32 import windows as W
+                W.set_round_corners(h)
             if self._acrylic:
                 self._apply_acrylic(h)
         except Exception:  # noqa: BLE001
@@ -317,7 +345,10 @@ class SwitcherWindow(QWidget):
             bx, by, bw, bh = self._preview_box(c)
             by += dy
             on_strip = (x + w > 0 and x < self.width()) and bw > 1 and bh > 1
-            if not on_strip or op < 0.02:
+            # ระหว่างการ์ดกำลังหายไป ซ่อน thumbnail ของการ์ดที่เลื่อนมาทับช่องของมัน
+            # (thumbnail วาดทับ Qt เสมอ จึงจะโผล่ทันทีโดยไม่รอ animation); จบแล้ว _relayout แสดงคืน
+            blocked = c not in self._dying and any(x_overlap(c.rect, d.rect) for d in self._dying)
+            if not on_strip or blocked or op < 0.02:
                 W.update_thumbnail(c.thumb, (0, 0, 1, 1), 0, False)
                 return
             if c.src_size:
@@ -412,7 +443,11 @@ class SwitcherWindow(QWidget):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         bg = QPainterPath()
         bg.addRoundedRect(QRectF(0, 0, self.width(), self.height()), 20, 20)
-        p.fillPath(bg, QColor(24, 24, 28, 120 if self._acrylic else 215))
+        if self._translucent:
+            p.fillPath(bg, QColor(24, 24, 28, 120 if self._acrylic else 215))
+        else:
+            # พื้นทึบเต็มหน้าต่าง (มุมมนมาจาก DWM บน Win11; Win10 เป็นสี่เหลี่ยม)
+            p.fillRect(self.rect(), QColor(30, 30, 35))
         # วาดจากไกลมาใกล้ ให้การ์ดกลางอยู่บนสุด
         order = sorted(range(len(self._cards)), key=lambda i: -abs(i - self._position))
         for i in order:

@@ -30,6 +30,9 @@ SOUND_SPECS: dict[str, tuple[Sequence[Tone], float]] = {
     "toggle_on": ((( 600.0, 1400.0),), 0.120),
     "toggle_off": (((1400.0, 600.0),), 0.120),
     "notify": ((1200.0, 900.0), 0.160),
+    "switcher_open": ((900.0, 1200.0), 0.070),
+    "switch": (((1100.0, 1700.0),), 0.090),
+    "minimize": (((1300.0, 700.0),), 0.100),
 }
 
 # event จาก gestures/lifecycle -> ชื่อเสียง
@@ -41,6 +44,9 @@ EVENT_SOUNDS: dict[str, str] = {
     "toggle_on": "toggle_on",
     "toggle_off": "toggle_off",
     "exit": "notify",
+    "switcher_open": "switcher_open",
+    "switcher_commit": "switch",
+    "switcher_minimize": "minimize",
 }
 
 

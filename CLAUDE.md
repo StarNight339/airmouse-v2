@@ -32,7 +32,16 @@
   - เจอแล้ว: NVIDIA Overlay และแอป Dynamic Island บัง UIA `ElementFromPoint` จึงต้องเช็กว่าปุ่มอยู่ในหน้าต่างจริงที่ `WindowFromPoint` คืนมา ทำไว้แล้ว
   - คอมมิตยังไม่ได้ push: Phase 4 ทั้งหมดและ snap จะ push หลังทดสอบสดผ่าน
 - **branch `custom-ui` (worktree `..\airmouse-v2-ui`):** อีกเซสชันใช้คุยเรื่องการปรับแต่งและ custom UI
-- **Phase 5 (Swipe Switcher) และ Phase 6 (calibrate, โหมดฝึก, polish):** ยังไม่เริ่ม
+- **Phase 5 (Swipe Switcher):** เขียนเสร็จ ผ่านการตรวจของ Opus และแก้ตามแล้ว เชื่อมเข้า `app.py` แล้ว รอทดสอบสด
+  - **ไฟล์:** `gestures.py` (mode switcher), `switcher_model.py` (Carousel), `platform/win32/windows.py`, `ui/switcher.py`, `_SwitcherUI` ใน `app.py`
+  - **ท่า:** ชี้+กลาง+นางเหยียด พับก้อย (gap = min(i,m,r) − ก้อย > 0.15) ค้าง 300 ms
+  - **ที่มาของเกณฑ์:** log `20261027-202631` และ replay log เก่าทั้งหมดแล้วไม่เปิดเองเลย
+  - **ต้องดูตอนทดสอบสด:**
+    - DWM preview ขึ้นไหม (log บอกว่าหน้าต่าง layered หรือเปล่า)
+    - activate สลับหน้าต่างได้จริงไหม
+    - ความเร็วปัดขึ้น (เกณฑ์ 6 hand/s อาจสูงไป)
+    - `switcher_step` 0.4
+- **Phase 6 (calibrate, โหมดฝึก, polish):** ยังไม่เริ่ม
 
 ## ผู้ใช้
 - คุยภาษาไทย ใช้**มือซ้าย** (`config.toml`: `hand = "left"`, `normal_facing = -1`)

@@ -303,7 +303,7 @@ class FakeGestures:
     def __init__(self, states):
         self.states = list(states)
 
-    def update(self, feats, ts):
+    def update(self, feats, ts, aspect=4 / 3):
         return self.states.pop(0)
 
 
@@ -816,3 +816,105 @@ def test_snap_slow_sweep_over_button_row_does_not_stick_to_last(fps):
     assert hov is None and x > row[-1].right + SnapConfig().capture_px * HYSTERESIS
     xs = [out[0] for out, _ in seq]
     assert all(b >= a - 1.0 for a, b in zip(xs, xs[1:]))  # cursor ไม่ถอยสวนทิศมือ
+
+
+# --- Swipe Switcher: Controller + _SwitcherUI (ของปลอม ไม่เปิดหน้าต่าง/สลับจริง) ---
+
+def test_controller_freezes_cursor_while_switcher_open():
+    c, m, mouse = _controller([ON, _on("switcher_open", mode="switcher"),
+                               _on(mode="switcher"), _on("switcher_commit"), ON])
+    for i in range(5):
+        c.step(_feats(), 1.0 + i * 0.1, 4 / 3)
+    assert len(m.updates) == 3            # เฟรม move 1 + หลังปิด 2 เท่านั้น
+    assert mouse.active[1:3] == [False, False]
+    assert len(m.resets) == 2             # ปิด switcher แล้วเริ่มจากตำแหน่ง cursor จริง
+
+
+def test_inference_emit_routes_switcher_events_with_dx():
+    from collections import deque
+
+    t = InferenceThread.__new__(InferenceThread)
+    t._events, t._sw_events = deque(), deque()
+    t._emit(("click_left", "switcher_minimize"), 1.5)
+    assert t.drain_events() == ["click_left", "switcher_minimize"]
+    assert t.drain_switcher_events() == [("switcher_minimize", 1.5)]
+
+
+class _FakeWin32:
+    def __init__(self, n):
+        self.wins = [SimpleNamespace(hwnd=100 + i, title=f"w{i}", exe="a.exe") for i in range(n)]
+        self.minimized, self.activated = [], []
+
+    def list_switch_windows(self, pid):
+        return list(self.wins)
+
+    def minimize(self, hwnd):
+        self.minimized.append(hwnd)
+
+    def activate(self, hwnd):
+        self.activated.append(hwnd)
+        return True
+
+
+class _FakeSwitcherWindow:
+    def __init__(self):
+        self.is_open = False
+        self.removed, self.positions = [], []
+
+    def open(self, wins, pos):
+        self.is_open = True
+
+    def set_position(self, pos, sel):
+        self.positions.append((pos, sel))
+
+    def animate_remove(self, i):
+        self.removed.append(i)
+
+    def close_switcher(self):
+        self.is_open = False
+
+
+def _switcher_ui(n):
+    from airmouse.app import _SwitcherUI
+
+    w32, win = _FakeWin32(n), _FakeSwitcherWindow()
+    return _SwitcherUI(True, win32=w32, window=win), w32, win
+
+
+def _join_activate():
+    import threading
+    for th in threading.enumerate():
+        if th.name == "activate":
+            th.join(1)
+
+
+def test_switcher_ui_commit_activates_card_from_event_dx():
+    ui, w32, win = _switcher_ui(5)
+    ui.handle("switcher_open", 0.0, 0.0)
+    assert ui.is_open and win.is_open
+    ui.tick(0.0, 1, 0.03)
+    ui.handle("switcher_commit", 2.0, 0.06)  # มือเลื่อน +2 การ์ดจากใบที่ 2 → ใบที่ 4
+    _join_activate()
+    assert w32.activated == [103] and not ui.is_open and not win.is_open
+
+
+def test_switcher_ui_minimize_removes_target_card_and_cancel_closes():
+    ui, w32, win = _switcher_ui(3)
+    ui.handle("switcher_open", 0.0, 0.0)
+    ui.handle("switcher_minimize", 0.0, 0.1)
+    assert w32.minimized == [101] and win.removed == [1] and ui.is_open
+    ui.handle("switcher_cancel", 0.0, 0.2)
+    assert not ui.is_open and w32.activated == []
+
+
+def test_switcher_ui_needs_two_windows_and_closes_when_frames_stop():
+    ui, w32, win = _switcher_ui(1)
+    ui.handle("switcher_open", 0.0, 0.0)
+    assert not ui.is_open                  # หน้าต่างเดียว ไม่มีอะไรให้สลับ
+    ui, w32, win = _switcher_ui(3)
+    ui.handle("switcher_open", 0.0, 0.0)
+    ui.tick(0.0, 7, 0.1)
+    ui.tick(0.0, 7, 0.5)
+    assert ui.is_open
+    ui.tick(0.0, 7, 1.2)                   # seq เดิมเกิน 1 วิ (กล้องค้าง) → ปิด
+    assert not ui.is_open and not win.is_open
