@@ -32,7 +32,9 @@
   - เจอแล้ว: NVIDIA Overlay และแอป Dynamic Island บัง UIA `ElementFromPoint` จึงต้องเช็กว่าปุ่มอยู่ในหน้าต่างจริงที่ `WindowFromPoint` คืนมา ทำไว้แล้ว
   - คอมมิตยังไม่ได้ push: Phase 4 ทั้งหมดและ snap จะ push หลังทดสอบสดผ่าน
 - **branch `custom-ui` (worktree `..\airmouse-v2-ui`):** อีกเซสชันใช้คุยเรื่องการปรับแต่งและ custom UI
-- **Phase 5 (Swipe Switcher):** เขียนเสร็จ ผ่านการตรวจของ Opus และแก้ตามแล้ว เชื่อมเข้า `app.py` แล้ว รอทดสอบสด
+- **Phase 5 (Swipe Switcher):** เสร็จและ push แล้ว ทดสอบสดรอบ 2026-10-27 (ผู้ใช้: "ความรู้สึกในการใช้ดีมาก")
+  - ผ่าน: เปิด/สลับ 6/6 ครั้ง, Microsoft Store ก็สลับได้, ไม่เปิดเองโดยบังเอิญ, หน้าต่าง switcher ไม่ layered
+  - **ยังไม่ได้ทดสอบสด:** ยกเลิก (พลิก/ปัดลง/มือหาย), ปัดขึ้นเพื่อย่อ, 5+ หน้าต่าง
   - **ไฟล์:** `gestures.py` (mode switcher), `switcher_model.py` (Carousel), `platform/win32/windows.py`, `ui/switcher.py`, `_SwitcherUI` ใน `app.py`
   - **ท่า:** ชี้+กลาง+นางเหยียด พับก้อย (gap = min(i,m,r) − ก้อย > 0.15) ค้าง 300 ms
   - **ที่มาของเกณฑ์:** log `20261027-202631` และ replay log เก่าทั้งหมดแล้วไม่เปิดเองเลย
