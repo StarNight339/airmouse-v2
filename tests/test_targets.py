@@ -118,3 +118,48 @@ def test_same_app_by_pid_or_exe(monkeypatch):
     assert T._same_app(1, 2)
     assert not T._same_app(1, 3)
     assert not T._same_app(4, 3)
+
+
+# --- UiaBackoff: UIA ล้มติดกันแล้วพักชั่วคราว ไม่ปิดถาวร ---
+
+def _fail(b, n, now):
+    return [b.record(True, now) for _ in range(n)]
+
+
+def test_backoff_pauses_after_limit_then_ready_after_retry():
+    b = T.UiaBackoff()
+    assert _fail(b, T.UIA_FAIL_LIMIT, 100.0) == [False] * (T.UIA_FAIL_LIMIT - 1) + [True]
+    assert not b.ready(100.0 + T.UIA_RETRY_S - 0.1)
+    assert b.ready(100.0 + T.UIA_RETRY_S)
+    b.resumed()
+    assert not b.ready(1e9)
+
+
+def test_backoff_success_resets_streak():
+    b = T.UiaBackoff()
+    _fail(b, T.UIA_FAIL_LIMIT - 1, 0.0)
+    assert b.record(False, 0.0) is False
+    assert _fail(b, T.UIA_FAIL_LIMIT - 1, 0.0) == [False] * (T.UIA_FAIL_LIMIT - 1)
+
+
+def test_backoff_doubles_while_still_failing_and_resets_on_success():
+    b = T.UiaBackoff()
+    waits = []
+    now = 0.0
+    for _ in range(5):
+        _fail(b, T.UIA_FAIL_LIMIT, now)
+        waits.append(b.until - now)
+        now = b.until
+        b.resumed()
+    assert waits == [10.0, 20.0, 40.0, 60.0, 60.0]
+    b.record(False, now)  # กลับมาใช้ได้ครั้งเดียว = เริ่มนับใหม่
+    _fail(b, T.UIA_FAIL_LIMIT, now)
+    assert b.until - now == T.UIA_RETRY_S
+
+
+def test_backoff_pause_on_create_failure_also_backs_off():
+    b = T.UiaBackoff()
+    b.pause(0.0)
+    assert b.until == T.UIA_RETRY_S
+    b.pause(b.until)
+    assert b.until == T.UIA_RETRY_S + 2 * T.UIA_RETRY_S

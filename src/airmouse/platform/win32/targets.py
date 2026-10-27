@@ -32,7 +32,9 @@ _uia_err_log = RateLimitedLog(log)
 
 STALE_S = 0.5  # targets เก่ากว่านี้ถือว่าไม่มี
 UIA_TIMEOUT_MS = 200
-UIA_FAIL_LIMIT = 5  # query UIA ล้มเหลวทั้งหมดติดกันกี่ครั้งถึงเลิกใช้ UIA
+UIA_FAIL_LIMIT = 5  # query UIA ล้มเหลวทั้งหมดติดกันกี่ครั้งถึงพัก UIA
+UIA_RETRY_S = 10.0  # พัก UIA เท่านี้แล้วสร้างใหม่ (เช่นโปรแกรมใต้ cursor ค้าง Not Responding)
+UIA_RETRY_MAX_S = 60.0  # กลับมาแล้วยังล้มอีก พักนานขึ้นเท่าตัวจนถึงเท่านี้
 RING_POINTS = 8
 MAX_ANCESTORS = 3
 MAX_DEPTH = 25
@@ -373,6 +375,42 @@ class _Uia:
         return None
 
 
+class UiaBackoff:
+    """นับ query UIA ที่ล้มเหลวทั้งหมดติดกัน → พัก UIA ชั่วคราวแล้วค่อยสร้างใหม่ (ไม่ปิดถาวร)
+    พักครั้งแรก UIA_RETRY_S แล้วเท่าตัวทุกรอบที่กลับมาแล้วยังล้มอีก (สูงสุด UIA_RETRY_MAX_S)
+    query สำเร็จครั้งเดียวรีเซ็ตทั้งหมด (pure logic ไม่แตะ COM)"""
+
+    def __init__(self) -> None:
+        self.streak = 0
+        self.retry_s = UIA_RETRY_S
+        self.until: float | None = None  # พักอยู่จนถึงเวลานี้ (monotonic); None = ไม่ได้พัก
+
+    def record(self, failed: bool, now: float) -> bool:
+        """บันทึกผล query หนึ่งครั้ง; True = ควรพัก UIA ตั้งแต่ตอนนี้"""
+        if not failed:
+            self.streak = 0
+            self.retry_s = UIA_RETRY_S
+            return False
+        self.streak += 1
+        if self.streak < UIA_FAIL_LIMIT:
+            return False
+        self.streak = 0
+        self.pause(now)
+        return True
+
+    def pause(self, now: float) -> None:
+        """เริ่มพัก (ใช้ตรง ๆ เมื่อสร้าง UIA ใหม่ไม่สำเร็จด้วย) รอบถัดไปพักนานขึ้นเท่าตัว"""
+        self.until = now + self.retry_s
+        self.retry_s = min(self.retry_s * 2, UIA_RETRY_MAX_S)
+
+    def ready(self, now: float) -> bool:
+        """พักครบแล้ว ควรลองสร้าง UIA ใหม่"""
+        return self.until is not None and now >= self.until
+
+    def resumed(self) -> None:
+        self.until = None
+
+
 class TargetFinder(threading.Thread):
     def __init__(self, search_px: float = 48.0, use_uia: bool = True, hz: float = 12.0) -> None:
         super().__init__(name="targets", daemon=True)
@@ -487,12 +525,20 @@ class TargetFinder(threading.Thread):
                 except Exception as e:  # noqa: BLE001
                     log.warning("ใช้ UI Automation ไม่ได้ (%s) -> ใช้เฉพาะปุ่ม caption", e)
                     uia = None
-            fail_streak = 0
+            backoff = UiaBackoff()
             while not self._stop_evt.is_set():
                 if not self._active_evt.wait(0.2):
                     continue
                 if self._stop_evt.is_set():
                     break
+                if backoff.ready(time.monotonic()):
+                    try:
+                        uia = _Uia()
+                        backoff.resumed()
+                        log.info("สร้าง UI Automation ใหม่ กลับมาหาปุ่มในโปรแกรมแล้ว")
+                    except Exception as e:  # noqa: BLE001
+                        self._set_error(f"uia create: {e}")
+                        backoff.pause(time.monotonic())  # ยังไม่พร้อม พักแล้วลองใหม่
                 t0 = time.perf_counter()
                 with self._lock:
                     probe = self._probe
@@ -504,10 +550,10 @@ class TargetFinder(threading.Thread):
                     except Exception as e:  # noqa: BLE001
                         self._set_error(f"query: {e}")
                         result, failed = [], False
-                    fail_streak = fail_streak + 1 if failed else 0
-                    if uia is not None and fail_streak >= UIA_FAIL_LIMIT:
-                        log.warning("UIA ล้มเหลวต่อเนื่อง -> ใช้เฉพาะปุ่ม caption")
-                        uia = None
+                    if uia is not None and backoff.record(failed, time.monotonic()):
+                        log.warning("UIA ล้มเหลวต่อเนื่อง -> ใช้เฉพาะปุ่ม caption %.0f วิ แล้วลองใหม่",
+                                    backoff.until - time.monotonic())
+                        uia = None  # ทิ้ง object เดิม (อาจค้างอยู่กับโปรแกรมที่ไม่ตอบสนอง)
                     dt = time.perf_counter() - t0
                     self._last_q = (probe, t0)
                     with self._lock:
