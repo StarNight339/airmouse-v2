@@ -38,6 +38,8 @@ class Tray(QSystemTrayIcon):
     debug_requested = Signal()
     open_config_requested = Signal()
     quit_requested = Signal()
+    calibrate_requested = Signal()
+    practice_requested = Signal()
     snap_toggled = Signal(bool)  # เมนู "Snap เกาะปุ่ม" ถูกติ๊ก/เอาออก
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
@@ -55,9 +57,10 @@ class Tray(QSystemTrayIcon):
         self._act_debug = menu.addAction("หน้าต่าง debug")
         self._act_debug.triggered.connect(self.debug_requested)
         menu.addSeparator()
-        for text in ("Calibrate (เร็วๆ นี้)", "โหมดฝึก (เร็วๆ นี้)"):
-            a: QAction = menu.addAction(text)
-            a.setEnabled(False)
+        self._act_calibrate: QAction = menu.addAction("Calibrate…")
+        self._act_calibrate.triggered.connect(self.calibrate_requested)
+        self._act_practice: QAction = menu.addAction("โหมดฝึก")
+        self._act_practice.triggered.connect(self.practice_requested)
         menu.addSeparator()
         self._act_config = menu.addAction("เปิด config.toml")
         self._act_config.triggered.connect(self.open_config_requested)

@@ -1,7 +1,9 @@
-"""python -m airmouse [--debug-view] [--debug] [--stay] [--log-pose] [--config PATH]"""
+"""python -m airmouse [--debug-view] [--debug] [--stay] [--log-pose] [--calibrate] [--practice]
+[--config PATH]"""
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -9,6 +11,11 @@ from .config import DEFAULT_CONFIG_PATH
 
 
 def main(argv: list[str] | None = None) -> int:
+    # .exe แบบไม่มี console: stdout/stderr เป็น None → print/logging จะพัง ส่งทิ้งไป devnull
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
     # console บน Windows อาจเป็น cp1252 ซึ่งพิมพ์ภาษาไทยไม่ได้
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -22,6 +29,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="ไม่ปิดโปรแกรมเองเมื่อไม่เห็นมือนาน (เฉพาะรอบนี้)")
     parser.add_argument("--log-pose", action="store_true",
                         help="บันทึกค่ามือ (curl, pinch, facing, mode) ทุกเฟรมลง log (ใช้กับ --debug)")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="เปิดหน้าต่าง calibrate ท่ามือตอนเริ่ม (เขียนผลลง config)")
+    parser.add_argument("--practice", action="store_true",
+                        help="เปิดโหมดฝึก (คลิก ลาก scroll) ตอนเริ่ม")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH,
                         help="ไฟล์ config (ค่าเริ่มต้น: config.toml ที่ root โปรเจกต์)")
     args = parser.parse_args(argv)

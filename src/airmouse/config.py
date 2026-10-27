@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
+import os
+import re
+import shutil
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,7 +16,15 @@ import tomli_w
 
 log = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+def project_root(frozen: bool, executable: str, module_file: str) -> Path:
+    """.exe (PyInstaller one-folder): config.toml, models/, logs/, assets/ อยู่ข้าง exe
+    ไม่งั้นเป็น root ของ repo (src/airmouse/config.py → ขึ้นไปสองชั้น)"""
+    if frozen:
+        return Path(executable).resolve().parent
+    return Path(module_file).resolve().parents[2]
+
+
+PROJECT_ROOT = project_root(getattr(sys, "frozen", False), sys.executable, __file__)
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.toml"
 MODELS_DIR = PROJECT_ROOT / "models"
 LOGS_DIR = PROJECT_ROOT / "logs"
@@ -91,6 +104,11 @@ class SwitcherConfig:
 
 
 @dataclass
+class MetaConfig:
+    calibrated: str = ""         # เวลา (ISO) ที่ calibrate ล่าสุด; ว่าง = ยังไม่เคย
+
+
+@dataclass
 class Config:
     camera: CameraConfig = field(default_factory=CameraConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
@@ -98,6 +116,7 @@ class Config:
     app: AppConfig = field(default_factory=AppConfig)
     snap: SnapConfig = field(default_factory=SnapConfig)
     switcher: SwitcherConfig = field(default_factory=SwitcherConfig)
+    meta: MetaConfig = field(default_factory=MetaConfig)
 
 
 _CHOICES = {
@@ -165,3 +184,129 @@ def save(cfg: Config, path: Path = DEFAULT_CONFIG_PATH) -> None:
     # หมายเหตุ: tomli-w ไม่เก็บ comment เดิมในไฟล์
     with path.open("wb") as fh:
         tomli_w.dump(dataclasses.asdict(cfg), fh)
+
+
+# ---------------------------------------------------------------- แก้ค่าใน TOML โดยเก็บ comment
+_SECTION_RE = re.compile(r"^\s*\[\s*([^\[\]]+?)\s*\]\s*(#.*)?$")
+
+
+def _format_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        s = repr(value)
+        return s if ("." in s or "e" in s or "n" in s) else s + ".0"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)  # basic string ของ TOML escape เหมือน JSON
+    raise TypeError(f"รูปแบบค่าไม่รองรับ: {value!r}")
+
+
+def _split_eol(line: str) -> tuple[str, str]:
+    body = line.rstrip("\r\n")
+    return body, line[len(body):]
+
+
+def _value_end(s: str, start: int) -> int:
+    """ตำแหน่งท้าย token ของค่าที่เริ่มที่ start (รองรับสตริงที่มี # หรือ \\" ข้างใน)"""
+    if start >= len(s):
+        return start
+    ch = s[start]
+    if ch == '"':
+        i = start + 1
+        while i < len(s):
+            if s[i] == "\\":
+                i += 2
+                continue
+            if s[i] == '"':
+                return i + 1
+            i += 1
+        return len(s)
+    if ch == "'":
+        j = s.find("'", start + 1)
+        return len(s) if j < 0 else j + 1
+    i = start
+    while i < len(s) and not s[i].isspace() and s[i] != "#":
+        i += 1
+    return i
+
+
+def _apply_one(lines: list[str], eol: str, section: str, key: str, token: str) -> list[str]:
+    key_re = re.compile(r"^(\s*)" + re.escape(key) + r"(\s*=\s*)")
+    cur: str | None = None
+    sec_start = -1   # index บรรทัดหลัง header ของ section ที่ต้องการ
+    last_content = -1  # บรรทัดสุดท้ายที่ไม่ว่างใน section นั้น
+    for i, line in enumerate(lines):
+        body, _ = _split_eol(line)
+        m = _SECTION_RE.match(body)
+        if m:
+            if cur == section:
+                break  # เจอ header ถัดไป จบ section
+            cur = m.group(1)
+            if cur == section:
+                sec_start = i + 1
+                last_content = i
+            continue
+        if cur != section:
+            continue
+        if body.strip():
+            last_content = i
+        km = key_re.match(body)
+        if km:
+            end = _value_end(body, km.end())
+            lines[i] = body[:km.end()] + token + body[end:] + line[len(body):]
+            return lines
+    if sec_start >= 0:  # มี section แต่ไม่มี key: เพิ่มท้าย section (ก่อนบรรทัดว่างท้าย)
+        prev_body, prev_eol = _split_eol(lines[last_content])
+        if not prev_eol:
+            lines[last_content] = prev_body + eol
+            lines.insert(last_content + 1, f"{key} = {token}")
+        else:
+            lines.insert(last_content + 1, f"{key} = {token}{eol}")
+        return lines
+    # ไม่มี section: เพิ่มท้ายไฟล์
+    if lines:
+        last_body, last_eol = _split_eol(lines[-1])
+        trailing = bool(last_eol)
+        if not last_eol:
+            lines[-1] = last_body + eol
+        if last_body.strip():
+            lines.append(eol)
+    else:
+        trailing = True
+    lines.append(f"[{section}]{eol}")
+    lines.append(f"{key} = {token}" + (eol if trailing else ""))
+    return lines
+
+
+def update_toml_text(text: str, updates: dict[tuple[str, str], object]) -> str:
+    """แก้เฉพาะ token ค่าของ key ที่ระบุ เก็บ indentation ช่องว่างและ comment เดิมไว้ (pure)
+    ไม่มี key → เพิ่มท้าย section ไม่มี section → เพิ่มท้ายไฟล์; คงรูปแบบขึ้นบรรทัดใหม่ของไฟล์เดิม"""
+    eol = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines(keepends=True)
+    for (section, key), value in updates.items():
+        lines = _apply_one(lines, eol, section, key, _format_value(value))
+    return "".join(lines)
+
+
+def update_values(path: Path, updates: dict[tuple[str, str], object]) -> None:
+    """เขียนค่าที่เปลี่ยนลงไฟล์ config โดยเก็บ comment: ตรวจความถูกต้องก่อน (error = ไม่เขียนอะไร)
+    สำรองไฟล์เดิมเป็น <ชื่อ>.bak แล้วเขียนแบบ atomic (ไฟล์ชั่วคราว + os.replace)"""
+    fields = {s.name: {f.name for f in dataclasses.fields(getattr(Config(), s.name))}
+              for s in dataclasses.fields(Config)}
+    for section, key in updates:
+        if key not in fields.get(section, ()):
+            raise ValueError(f"ไม่รู้จัก [{section}] {key}")
+    raw = path.read_bytes() if path.exists() else b""
+    new = update_toml_text(raw.decode("utf-8"), updates)
+    from_dict(tomllib.loads(new))  # ค่าผิดชนิด/นอกช่วง → raise ก่อนเขียน
+    if path.exists():
+        shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_bytes(new.encode("utf-8"))
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()

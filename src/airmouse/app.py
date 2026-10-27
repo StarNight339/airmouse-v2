@@ -286,6 +286,7 @@ class InferenceThread(threading.Thread):
         self._lock = threading.Lock()
         self._latest: FrameResult | None = None
         self._stop_event = threading.Event()
+        self._paused = threading.Event()  # set = ไม่ส่งท่ามือเข้า Controller (ยังคำนวณ feats ให้ UI)
         self.error: str | None = None
         self.fps = RateMeter()
 
@@ -299,6 +300,13 @@ class InferenceThread(threading.Thread):
         while self._events:
             out.append(self._events.popleft())
         return out
+
+    def set_paused(self, paused: bool) -> None:
+        """thread-safe: พักการควบคุมด้วยมือ (ระหว่าง calibrate) ผล latest ยังมี feats ตามปกติ"""
+        if paused:
+            self._paused.set()
+        else:
+            self._paused.clear()
 
     def drain_switcher_events(self) -> list[tuple[str, float]]:
         """event switcher_* พร้อม switcher_dx ของเฟรมที่เกิด สำหรับ Qt main thread"""
@@ -317,6 +325,7 @@ class InferenceThread(threading.Thread):
         seq = 0
         last_ts: float | None = None
         low_power = False
+        was_paused = False
         last_processed = float("-inf")
         stats = _DebugStats(self._controller) if self._debug else None
         recorder = None
@@ -349,7 +358,13 @@ class InferenceThread(threading.Thread):
                 infer_ms = (time.perf_counter() - t0) * 1000
                 gesture = target = life = None
                 speed = gain = 0.0
-                if self._controller is not None:
+                paused = self._paused.is_set()
+                if self._controller is not None and paused and not was_paused:
+                    # เริ่มพัก (เช่น calibrate): ปิดการควบคุม + ปล่อยปุ่ม/ลากที่ค้างครั้งเดียว
+                    self._emit(self._controller.gestures.disable())
+                    self._controller.step(None, ts, w / h)
+                was_paused = paused
+                if self._controller is not None and not paused:
                     gesture, target = self._controller.step(feats, ts, w / h)
                     speed, gain = self._controller.motion.speed, self._controller.motion.gain
                     self._emit(gesture.events, gesture.switcher_dx)
@@ -604,6 +619,10 @@ class _AppUI:
         self._tray.debug_requested.connect(self._show_debug)
         self._tray.open_config_requested.connect(self._open_config)
         self._tray.quit_requested.connect(app.quit)
+        self._tray.calibrate_requested.connect(self._show_calibrate)
+        self._tray.practice_requested.connect(self._show_practice)
+        self._calibrate = None
+        self._practice = None
         self._tray.set_snap_checked(cfg.snap.enabled)
         self._tray.snap_toggled.connect(self._set_snap)
         self._tray.set_status("Air Mouse: ปิดการควบคุม (พลิกมือค้างเพื่อเปิด)", False)
@@ -617,6 +636,44 @@ class _AppUI:
         self._timer = QTimer()
         self._timer.timeout.connect(self._tick)
         self._timer.start(16)
+
+        if args.calibrate:
+            self._show_calibrate()
+        elif args.practice:
+            self._show_practice()
+        elif not getattr(getattr(cfg, "meta", None), "calibrated", "x"):
+            # ยังไม่เคย calibrate: เกณฑ์ใน config มาจากมือคนอื่น อาจใช้ได้ไม่ดี
+            self._tray.notify("Air Mouse", "ยังไม่ได้ calibrate ท่ามือ: คลิกขวาที่ไอคอน → Calibrate…",
+                              6000)
+
+    def _show_calibrate(self) -> None:
+        if self._calibrate is None:
+            from .ui.calibrate import CalibrateWindow
+            self._inference.set_paused(True)  # ทำท่าตามขั้นตอนต้องไม่คลิก/ลากของจริง
+            self._calibrate = CalibrateWindow(self._inference, self._cfg, self._args.config)
+            self._calibrate.saved.connect(
+                lambda values: log.info("calibrate: บันทึก %d ค่าลง %s", len(values),
+                                        self._args.config))
+            self._calibrate.closed.connect(self._calibrate_closed)
+        self._calibrate.show()
+        self._calibrate.raise_()
+        self._calibrate.activateWindow()
+
+    def _calibrate_closed(self) -> None:
+        self._calibrate = None
+        self._inference.set_paused(False)  # ต้องพลิกมือเปิดการควบคุมใหม่ (disable ไปแล้ว)
+
+    def _show_practice(self) -> None:
+        if self._practice is None:
+            from .ui.practice import PracticeWindow
+            self._practice = PracticeWindow(config_mod.LOGS_DIR)
+            self._practice.closed.connect(self._practice_closed)
+        self._practice.showFullScreen()
+        self._practice.raise_()
+        self._practice.activateWindow()
+
+    def _practice_closed(self) -> None:
+        self._practice = None
 
     def _show_debug(self) -> None:
         if self._view is None:

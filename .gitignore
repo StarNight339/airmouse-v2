@@ -8,6 +8,7 @@ logs/
 build/
 dist/
 *.spec
+!airmouse.spec
 .pytest_cache/
 .vscode/
 .idea/

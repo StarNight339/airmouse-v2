@@ -58,3 +58,6 @@ uia = true                # หาปุ่มในโปรแกรมด้�
 [switcher]
 enabled = true            # ท่า 3 นิ้วเปิดตัวสลับหน้าต่าง
 preview = true            # แสดงภาพตัวอย่างหน้าต่างในการ์ด
+
+[meta]
+calibrated = ""           # เวลาที่ calibrate ล่าสุด (โปรแกรมเขียนให้เอง) ว่าง = ยังไม่เคย calibrate

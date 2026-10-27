@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+build = ["pyinstaller"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -830,6 +830,43 @@ def test_controller_freezes_cursor_while_switcher_open():
     assert len(m.resets) == 2             # ปิด switcher แล้วเริ่มจากตำแหน่ง cursor จริง
 
 
+def test_inference_pause_disables_control_once_and_skips_controller():
+    import numpy as _np
+
+    cam = FakeCamera()
+    cam.push = lambda: cam.frames.append(
+        (_np.zeros((48, 64, 3), _np.uint8), 1.0 + 0.033 * len(cam.frames)))
+    t = InferenceThread(cam, FakeTracker(hands={i: _hand() for i in range(10)}), False,
+                        False, controller=SimpleNamespace())
+    calls = []
+
+    class Ctrl:
+        motion = SimpleNamespace(speed=0.0, gain=0.0)
+        gestures = SimpleNamespace(disable=lambda: (calls.append("disable") or ["toggle_off"]))
+        finder = None
+        hovered = None
+
+        def step(self, feats, ts, aspect):
+            calls.append("step" if feats is not None else "release")
+            return GestureState(True, False, 0.0, False, False, mode="move"), None
+
+    t._controller = Ctrl()
+    t.set_paused(True)
+    t.start()
+    for _ in range(3):
+        cam.push()
+    import time as _t
+    _t.sleep(0.3)
+    t.set_paused(False)
+    cam.push()
+    _t.sleep(0.2)
+    t.stop()
+    t.join(timeout=1)
+    assert calls[:2] == ["disable", "release"] and calls.count("disable") == 1
+    assert "step" in calls[2:]  # เลิกพักแล้วกลับมาส่งท่ามือตามปกติ
+    assert "toggle_off" in t.drain_events()
+
+
 def test_inference_emit_routes_switcher_events_with_dx():
     from collections import deque
 
