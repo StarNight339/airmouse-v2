@@ -336,6 +336,9 @@ class FakeMotion:
     def set_position(self, xy):
         self.positions.append(xy)
 
+    def set_shown(self, xy):
+        self.shown = xy
+
     def boost_smoothing(self, seconds):
         self.boosts.append(seconds)
 
@@ -641,13 +644,21 @@ class FakeSnapper:
         self.cfg = SimpleNamespace(enabled=enabled)
         self.calls = []
         self.resets = 0
+        self.offset = (0.0, 0.0)
 
     def adjust(self, prev, target, speed, dt, targets):
         self.calls.append((prev, target, list(targets)))
-        return (target[0] - 1.0, target[1]), "BTN"  # ดึงเข้าหาปุ่ม 1 px
+        # หนืดลด virtual 1 px และแสดงถูกดึงเพิ่มอีก 1 px
+        self.offset = (-1.0, 0.0)
+        virtual = (target[0] - 1.0, target[1])
+        return virtual, (virtual[0] - 1.0, virtual[1]), "BTN"
 
     def reset(self):
         self.resets += 1
+        self.offset = (0.0, 0.0)
+
+    def clear_offset(self):
+        self.offset = (0.0, 0.0)
 
 
 class FakeFinder:
@@ -673,8 +684,10 @@ def test_snap_adjusts_target_and_syncs_motion_in_move_mode():
     c, m, mouse, s, f = _snap_controller([ON, ON])
     c.step(_feats(), 1.0, 4 / 3)
     c.step(_feats(), 1.1, 4 / 3)
-    assert mouse.targets[-1][:2] == (101.0, 50.0)  # motion 102 → snap ดึงเหลือ 101
-    assert m.positions[-1] == (101.0, 50.0)          # motion.set_position ให้เดินต่อจากจุดเกาะ
+    assert mouse.targets[-1][:2] == (100.0, 50.0)  # motion 102 → virtual 101 → แสดง 100
+    assert m.positions[-1] == (101.0, 50.0)          # ป้อนกลับแค่ virtual ไม่ใช่ตำแหน่งที่ดูด
+    assert m.shown == (100.0, 50.0)                  # history = ตำแหน่งที่แสดง (ใช้ย้อนคลิก)
+    assert s.calls[-1][0] == (100.0, 50.0)           # prev = virtual ของเฟรมก่อน (101 - 1)
     assert c.hovered == "BTN" and f.probes[-1] == (101.0, 50.0) and f.active[-1] is True
     assert s.calls[-1][2] == ["T1"]
 
@@ -685,14 +698,106 @@ def test_snap_off_while_dragging_and_when_disabled():
         c.step(_feats(), ts, 4 / 3)
     assert len(s.calls) == 1            # เฉพาะเฟรม move แรก
     assert c.hovered is None and f.active[-1] is False
+    # เฟรมเริ่มลาก: ฝัง offset ดึง (-1) เข้า motion ครั้งเดียว cursor ไม่กระโดดออกจากปุ่ม
+    assert mouse.targets[1][:2] == (101.0, 50.0) and m.positions[-1] == (101.0, 50.0)
+    assert mouse.targets[2][:2] == (103.0, 50.0)  # เฟรมถัดไป FakeMotion ไม่ได้ย้ายจริง
     c2, m2, mouse2, s2, f2 = _snap_controller([ON, ON], enabled=False)
     c2.step(_feats(), 1.0, 4 / 3)
     c2.step(_feats(), 1.1, 4 / 3)
     assert s2.calls == [] and mouse2.targets[-1][:2] == (102.0, 50.0)
 
 
+def test_snap_click_moves_virtual_to_click_point_without_bounce():
+    c, m, mouse, s, f = _snap_controller([ON, ON, _on("click_left")])
+    for ts in (1.0, 1.1, 1.2):
+        c.step(_feats(), ts, 4 / 3)
+    pos = mouse.cmds[-1][2]
+    assert m.positions[-1] == pos and c._snap_prev == pos and s.offset == (0.0, 0.0)
+
+
 def test_snap_resets_when_hand_lost():
     c, m, mouse, s, f = _snap_controller([ON, ON])
     c.step(_feats(), 1.0, 4 / 3)
+    r0 = s.resets  # เฟรมแรก reset ไปแล้วหนึ่งครั้งตอนตั้งต้น motion
     c.step(None, 1.1, 4 / 3)
-    assert c.hovered is None and s.resets == 1 and f.active[-1] is False
+    assert c.hovered is None and s.resets == r0 + 1 and f.active[-1] is False
+
+
+# --- Snap แบบ closed loop: Controller + Motion + Snapper จริง ---
+
+from dataclasses import dataclass as _dataclass  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+import pytest  # noqa: E402
+
+from airmouse.config import MotionConfig, SnapConfig  # noqa: E402
+from airmouse.motion import Motion  # noqa: E402
+from airmouse.snap import HYSTERESIS, Snapper  # noqa: E402
+
+
+@_dataclass(frozen=True)
+class _Btn:
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return ((self.left + self.right) / 2, (self.top + self.bottom) / 2)
+
+
+class _MouseAt(FakeMouse):
+    def __init__(self, xy):
+        super().__init__()
+        self.xy = xy
+
+    def resync(self):
+        super().resync()
+        return self.xy
+
+
+def _closed_loop(buttons, start_xy, hand_speed, fps, seconds):
+    """มือขยับไปทางขวาด้วยความเร็วคงที่ (hand-size/s) คืนลำดับ (out, hovered) ทุกเฟรม"""
+    n = int(seconds * fps)
+    motion = Motion(MotionConfig(), SimpleNamespace(x=0, y=0, w=1920, h=1080), 1080.0)
+    finder = FakeFinder()
+    finder.targets = list(buttons)
+    c = Controller(FakeGestures([ON] * n), motion, _MouseAt(start_xy),
+                   snapper=Snapper(SnapConfig()), finder=finder)
+    aspect, size, dt = 4 / 3, 0.2, 1 / fps
+    ax = 0.3
+    seq = []
+    for i in range(n):
+        ax += hand_speed * size * dt / aspect
+        feats = HandFeatures(curl={}, pinch=0.1, hand_size=size, anchor=(ax, 0.5))
+        _, out = c.step(feats, 1.0 + i * dt, aspect)
+        seq.append((out, c.hovered))
+    return seq
+
+
+@pytest.mark.parametrize("fps", [10, 30])
+@pytest.mark.parametrize("hand_speed", [0.2, 0.5])  # ช้ากว่า slow_speed ทั้งคู่ (โดนดูดตลอด)
+def test_snap_slow_hand_escapes_small_button(fps, hand_speed):
+    btn = _Btn(104, 99, 136, 131)  # 32x32 กลาง (120, 115)
+    seq = _closed_loop([btn], btn.center, hand_speed, fps, seconds=4.0)
+    assert seq[0][1] is btn
+    exit_x = btn.right + SnapConfig().capture_px * HYSTERESIS
+    (x, _), hov = seq[-1]
+    assert hov is None and x > exit_x  # หลุดออกมาได้ ไม่ค้างที่ปุ่ม
+
+
+@pytest.mark.parametrize("fps", [10, 30])
+def test_snap_slow_sweep_over_button_row_does_not_stick_to_last(fps):
+    # แถบปุ่ม 32 px ติดกัน ช่องว่าง 4 px (เช่น toolbar)
+    row = [_Btn(104 + i * 36, 99, 136 + i * 36, 131) for i in range(5)]
+    seq = _closed_loop(row, row[0].center, 0.3, fps, seconds=8.0)
+    visited = []
+    for _, hov in seq:
+        if hov is not None and (not visited or visited[-1] is not hov):
+            visited.append(hov)
+    assert visited == row  # เกาะทีละปุ่มตามลำดับ ไม่ย้อน ไม่ข้าม
+    (x, _), hov = seq[-1]
+    assert hov is None and x > row[-1].right + SnapConfig().capture_px * HYSTERESIS
+    xs = [out[0] for out, _ in seq]
+    assert all(b >= a - 1.0 for a, b in zip(xs, xs[1:]))  # cursor ไม่ถอยสวนทิศมือ

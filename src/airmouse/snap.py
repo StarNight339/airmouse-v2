@@ -23,10 +23,28 @@ def _center_dist2(t, x: float, y: float) -> float:
     return (cx - x) ** 2 + (cy - y) ** 2
 
 
+def _axis_pull(c: float, half: float, v: float, reach: float) -> float:
+    """offset ดูดตามแกนเดียว: แสดงที่ c + d*|d|/r แทน c + d (d = v - c, r = half + reach)
+    กลางปุ่มดูดแรง แล้วจางเป็น 0 พอดีที่ขอบโซน hover → ปล่อยปุ่มแล้วไม่กระโดด
+    และ d*|d|/r เพิ่มตาม d เสมอ cursor จึงไม่วิ่งสวนทิศมือ"""
+    r = half + reach
+    d = v - c
+    if abs(d) >= r:
+        return 0.0
+    return d * abs(d) / r - d
+
+
 class Snapper:
     """ปรับตำแหน่ง cursor ที่ Motion คำนวณ ให้เกาะปุ่มเมื่อมือช้า
+
+    แยกสองตำแหน่ง (ห้ามป้อนแรงดูดกลับเข้า Motion ไม่งั้นแรงดูด+หนืดเข้าสมดุลค้างที่ปุ่ม):
+    - virtual: ตำแหน่งตามมือที่ผ่านแค่หนืด → ป้อนกลับเข้า Motion ได้ (หนืดแค่ลดขนาดการขยับ)
+    - out = virtual + offset ดูด → ส่งให้เมาส์เท่านั้น offset ขึ้นกับ virtual อย่างเดียว
+      มือขยับต่อเนื่องจึงพา virtual ออกนอกปุ่มได้เสมอ
+
     - หนืด: บนปุ่มและมือไม่เร็วเกิน escape_speed การขยับเหลือ friction เท่า
-    - แม่เหล็ก: มือช้ากว่า slow_speed ดูดเข้ากลางปุ่มแบบ exponential (pull_time_s)
+    - แม่เหล็ก: มือช้ากว่า slow_speed ดึงที่แสดงเข้ากลางปุ่ม (ดู _axis_pull) offset ค่อย ๆ
+      เปลี่ยนแบบ exponential (pull_time_s) ทั้งตอนเริ่มดูด เปลี่ยนปุ่ม และปล่อย
       เฉพาะแกนที่ปุ่มเล็ก (<= search_px): ปุ่มใหญ่ เช่นแท็บ/รายการยาว ดูดตามแกนยาวแล้วน่ารำคาญ
       (หนืดยังทำงานทุกแกน)
     - มือเร็วกว่า escape_speed = สะบัดหลุด ไม่เกาะ
@@ -35,9 +53,24 @@ class Snapper:
     def __init__(self, cfg: SnapConfig) -> None:
         self.cfg = cfg
         self.hovered = None
+        self.offset: tuple[float, float] = (0.0, 0.0)  # out - virtual ล่าสุด
 
     def reset(self) -> None:
         self.hovered = None
+        self.offset = (0.0, 0.0)
+
+    def clear_offset(self) -> None:
+        """ทิ้ง offset (หลังย้าย virtual ไปที่ cursor ที่แสดงอยู่แล้ว เช่นหลังคลิก)"""
+        self.offset = (0.0, 0.0)
+
+    def _pull(self, hov, vx: float, vy: float) -> tuple[float, float]:
+        cfg = self.cfg
+        reach = cfg.capture_px * HYSTERESIS  # = ระยะที่ _select ยังคง hover
+        cx, cy = hov.center
+        w, h = hov.right - hov.left, hov.bottom - hov.top
+        px = _axis_pull(cx, w / 2, vx, reach) if w <= cfg.search_px else 0.0
+        py = _axis_pull(cy, h / 2, vy, reach) if h <= cfg.search_px else 0.0
+        return (px, py)
 
     def _select(self, x: float, y: float, targets: Sequence):
         cfg = self.cfg
@@ -56,31 +89,34 @@ class Snapper:
             return None
         return min(cands, key=lambda t: _center_dist2(t, x, y))
 
-    def adjust(self, prev_out: tuple[float, float], target: tuple[float, float], speed: float,
-               dt: float, targets: Sequence) -> tuple[tuple[float, float], object | None]:
+    def adjust(self, prev_virtual: tuple[float, float], target: tuple[float, float],
+               speed: float, dt: float, targets: Sequence
+               ) -> tuple[tuple[float, float], tuple[float, float], object | None]:
+        """target = ตำแหน่งจาก Motion (เดินต่อจาก prev_virtual) → (virtual, out, ปุ่มที่เกาะ)"""
         cfg = self.cfg
         if not cfg.enabled:
-            self.hovered = None
-            return (target, None)
+            self.reset()
+            return (target, target, None)
         x, y = target
         hov = self._select(x, y, targets) if targets else None
         if hov is not None and speed >= cfg.escape_speed:
             hov = None  # สะบัดเร็ว: หลุด ไม่เกาะ
         self.hovered = hov
+
+        want = (0.0, 0.0)
         if hov is None:
-            return (target, None)
+            vx, vy = x, y
+        else:
+            # หนืด: ขยับตามเป้าแค่ส่วนหนึ่ง (อยู่ระหว่าง prev_virtual กับ target เสมอ)
+            vx = prev_virtual[0] + (x - prev_virtual[0]) * cfg.friction
+            vy = prev_virtual[1] + (y - prev_virtual[1]) * cfg.friction
+            if speed < cfg.slow_speed:
+                want = self._pull(hov, vx, vy)
 
-        # หนืด: ขยับตามเป้าแค่ส่วนหนึ่ง (ผลอยู่ระหว่าง prev_out กับ target เสมอ → ไม่กระโดด)
-        ox = prev_out[0] + (x - prev_out[0]) * cfg.friction
-        oy = prev_out[1] + (y - prev_out[1]) * cfg.friction
-
-        # แม่เหล็ก: ดูดเข้ากลางปุ่ม (alpha < 1 จึงไม่เลยกลางปุ่ม)
-        if speed < cfg.slow_speed:
-            dt_c = min(DT_MAX, max(DT_MIN, dt))
-            alpha = 1.0 - math.exp(-dt_c / cfg.pull_time_s)
-            cx, cy = hov.center
-            if hov.right - hov.left <= cfg.search_px:
-                ox += (cx - ox) * alpha
-            if hov.bottom - hov.top <= cfg.search_px:
-                oy += (cy - oy) * alpha
-        return ((ox, oy), hov)
+        # offset ค่อย ๆ เข้าหาค่าที่ต้องการ: เริ่มดูด/เปลี่ยนปุ่ม/ปล่อยปุ่ม ไม่มีก้าวกระโดด
+        dt_c = min(DT_MAX, max(DT_MIN, dt))
+        alpha = 1.0 - math.exp(-dt_c / cfg.pull_time_s)
+        ox = self.offset[0] + (want[0] - self.offset[0]) * alpha
+        oy = self.offset[1] + (want[1] - self.offset[1]) * alpha
+        self.offset = (ox, oy)
+        return ((vx, vy), (vx + ox, vy + oy), hov)

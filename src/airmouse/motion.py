@@ -125,6 +125,13 @@ class Motion:
             ts = self._hist[-1][0]
             self._hist[-1] = (ts, self._pos[0], self._pos[1])
 
+    def set_shown(self, xy: tuple[float, float]) -> None:
+        """แก้ตัวล่าสุดใน history เป็นตำแหน่งที่ cursor แสดงจริง (snap ดึงไว้) โดยไม่แตะตำแหน่งสะสม
+        คลิกที่ย้อนตำแหน่งจึงลงที่ปุ่มที่เห็น ไม่ใช่ตำแหน่ง virtual"""
+        if self._hist:
+            ts = self._hist[-1][0]
+            self._hist[-1] = (ts, float(xy[0]), float(xy[1]))
+
     def boost_smoothing(self, seconds: float) -> None:
         """เพิ่ม smoothing ชั่วคราว (เริ่มลาก): leash ×BOOST_LEASH และ cutoff ×BOOST_CUTOFF
         แล้วค่อยลดเชิงเส้นกลับเป็นปกติตาม dt สะสม; เปลี่ยนแบบต่อเนื่อง ไม่มีก้าวกระโดดตอนจบ"""

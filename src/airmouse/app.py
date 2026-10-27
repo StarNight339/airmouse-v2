@@ -103,6 +103,10 @@ class Controller:
             pos = last[2]  # จุดเดียวกับครั้งก่อน → Windows นับเป็นดับเบิลคลิก
         self.mouse.click_at(pos[0], pos[1], btn)
         self.motion.set_position(pos)
+        if self._snap_prev is not None:
+            # virtual ย้ายมาที่จุดคลิก (ตำแหน่งที่แสดง) แล้ว → ทิ้ง offset ไม่งั้น cursor ดีดกลับ
+            self._snap_prev = pos
+            self.snapper.clear_offset()
         self._last_click = (btn, ts, pos)
         log.info("คลิก%s ที่ (%.0f, %.0f)", "ซ้าย" if btn == "left" else "ขวา", *pos)
 
@@ -147,6 +151,8 @@ class Controller:
                     self.motion.reset(self.mouse.resync())
                     self._need_reset = False
                     self._snap_prev = None
+                    if self.snapper is not None:
+                        self.snapper.reset()  # offset เก่าห้ามติดมากับตำแหน่งตั้งต้นใหม่
                 target = self.motion.update(feats.anchor, feats.hand_size, aspect, dt, ts=ts)
                 target = self._snap(g.mode, target, dt)
                 self.mouse.set_target(target[0], target[1], dt)
@@ -169,16 +175,28 @@ class Controller:
     def _snap(self, mode: str, target: tuple[float, float], dt: float) -> tuple[float, float]:
         """เกาะปุ่มเฉพาะโหมด move; ไม่ทำตอนลาก (ต้องลากได้อิสระ)"""
         if self.snapper is None or mode != "move" or not self.snapper.cfg.enabled:
+            if self.snapper is not None and self._snap_prev is not None:
+                # เลิก snap (เริ่มลาก/ปิดเมนู) ตอน cursor ยังถูกดึงอยู่: ฝัง offset เข้า motion
+                # ครั้งเดียว ไม่งั้น cursor กระโดดกลับไปที่ virtual (ลากเริ่มนอกปุ่ม)
+                ox, oy = self.snapper.offset
+                if ox or oy:
+                    target = (target[0] + ox, target[1] + oy)
+                    self.motion.set_position(target)
             self._snap_off()
             return target
         targets = self.finder.targets if self.finder is not None else []
         prev = self._snap_prev if self._snap_prev is not None else target
-        out, self.hovered = self.snapper.adjust(prev, target, self.motion.speed, dt, targets)
-        if out != target:
-            self.motion.set_position(out)  # ให้ motion เดินต่อจากจุดที่เกาะ ไม่เด้งกลับ
-        self._snap_prev = out
+        virtual, out, self.hovered = self.snapper.adjust(prev, target, self.motion.speed,
+                                                         dt, targets)
+        # ป้อนกลับเข้า motion แค่ virtual (หนืด) ห้ามป้อน out ไม่งั้นแรงดูดสะสมจนค้างที่ปุ่ม
+        if virtual != target:
+            self.motion.set_position(virtual)
+        if out != virtual:
+            self.motion.set_shown(out)
+        self._snap_prev = virtual
         if self.finder is not None:
-            self.finder.set_probe(*out)
+            # หาปุ่มรอบ virtual: ตำแหน่งเดียวกับที่ snapper ใช้เลือกปุ่ม
+            self.finder.set_probe(*virtual)
             self.finder.set_active(True)
         return out
 
