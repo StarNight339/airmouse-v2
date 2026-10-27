@@ -4,7 +4,8 @@ import pytest
 
 from airmouse.config import GestureConfig
 from airmouse.features import HandFeatures
-from airmouse.gestures import GestureTracker
+from airmouse.gestures import (GestureTracker, is_scroll_pose, is_switcher_pose, raw_pose,
+                               switcher_gap)
 
 FPS = [10, 30]
 EXT = 0.95
@@ -943,3 +944,442 @@ def test_many_requests_before_update_collapse_to_one_toggle():
         r.t.request_toggle()
     st = r.feed(NORMAL)
     assert st.events == ("toggle_on",)
+
+
+# ===================== Switcher (ท่า 3 นิ้ว) =====================
+SW_FPS = [16, 30]
+CFG = GestureConfig()
+
+
+def _sw(x=0.5, y=0.5, idx=0.95, mid=0.95, ring=0.95, pinky=0.75, facing=NORMAL_FACING,
+        pinch=0.05) -> HandFeatures:
+    """ท่า 3 นิ้ว: ก้อยพับ ~0.75 (gap +0.20) พร้อมกำหนดตำแหน่ง anchor"""
+    curl = {"thumb": 0.98, "index": idx, "middle": mid, "ring": ring, "pinky": pinky}
+    return HandFeatures(curl=curl, pinch=pinch, hand_size=0.2, anchor=(x, y),
+                        spread=0.7, palm_facing=facing)
+
+
+SW = _sw()
+BLUR = _sw(idx=0.5, mid=0.5, ring=0.5, pinky=0.70)        # motion blur: นิ้วบนตกหมด ก้อยยังอยู่
+SEMI = _sw(idx=0.85, mid=0.85, ring=0.85, pinky=0.75)     # gap 0.10: ยังนับว่าอยู่ในท่า แต่ไม่ถึงเกณฑ์เข้า
+AMBIG = _sw(idx=0.78, mid=0.78, ring=0.78, pinky=0.75)    # gap 0.03: ไม่ใช่ท่า, ไม่ใช่เลิกท่าชัดเจน
+SW_EVENTS = ("switcher_open", "switcher_commit", "switcher_cancel", "switcher_minimize")
+
+
+def _open_switcher(r: Rig, x: float = 0.5, y: float = 0.5) -> None:
+    r.feed_for(_sw(x, y), 0.5)
+    assert r.count("switcher_open") == 1
+    assert r.states[-1].mode == "switcher"
+    r.log.clear()
+
+
+def _sw_events(r: Rig) -> list[str]:
+    return [e for e in r.events() if e in SW_EVENTS]
+
+
+def _stroke(r: Rig, y0: float, direction: int, x: float = 0.5, drift: float = 0.0) -> float:
+    """สะบัดแนวตั้ง 4 เฟรม (~7.5–8 ขนาดมือ/วิ ที่ hand_size 0.2); direction -1 = ขึ้น, +1 = ลง"""
+    per = (0.05 if r.fps >= 30 else 0.1) * direction
+    for i in range(1, 5):
+        r.feed(_sw(x + drift * i / 4, y0 + per * i))
+    return y0 + 4 * per
+
+
+def test_switcher_predicates():
+    assert is_switcher_pose(SW.curl, CFG) and switcher_gap(SW.curl) == pytest.approx(0.20)
+    assert raw_pose(SW, CFG, -1) == "switcher"
+    assert raw_pose(_sw(pinch=0.01), CFG, -1) == "switcher"  # ก่อน pinch
+    assert raw_pose(_sw(facing=FLIP_FACING), CFG, -1) == "flip"  # flip สำคัญกว่า
+    assert not is_switcher_pose(FIST.curl, CFG)  # กำมือไม่ใช่ท่า 3 นิ้ว
+    assert not is_switcher_pose(NORMAL.curl, CFG)
+    assert not is_switcher_pose(_sw(idx=0.5, mid=0.5, ring=0.5, pinky=0.2).curl, CFG)  # ชี้กลางนางงอ
+    # ท่า 3 นิ้วที่ ring+pinky เฉลี่ยต่ำพอจะเป็น scroll ต้องไม่ถูกนับเป็น scroll
+    odd = _sw(ring=0.8, pinky=0.6)
+    assert is_switcher_pose(odd.curl, CFG) and not is_scroll_pose(odd.curl, CFG)
+    assert is_scroll_pose(SCROLL.curl, CFG)
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_opens_only_after_hold_and_never_scrolls(fps):
+    r = Rig(fps)
+    r.feed_for(SW, 0.2)
+    assert r.count("switcher_open") == 0 and r.states[-1].mode == "move"
+    r.feed_for(SW, 0.25)  # รวม ~0.45 s (เริ่มนับที่เฟรมที่ confirm)
+    assert r.count("switcher_open") == 1 and r.states[-1].mode == "switcher"
+    assert "scroll_start" not in r.events()
+    # ท่าที่ ring+pinky เฉลี่ยต่ำ (ปกติจะเป็น scroll) ก็ไม่ scroll ระหว่างนับค้าง
+    r2 = Rig(fps)
+    r2.feed_for(_sw(ring=0.8, pinky=0.6), 0.2)
+    assert "scroll_start" not in r2.events()
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_open_time_matches_hold(fps):
+    r = Rig(fps)
+    start = r.ts
+    r.feed_for(SW, 0.6)
+    t_open = [t for t, e in r.log if e == "switcher_open"][0]
+    assert 0.3 <= t_open - start <= 0.3 + 3 / fps + 1e-6
+
+
+def test_switcher_closes_scroll_when_opening():
+    r = Rig(30)
+    r.feed_for(SCROLL, 0.3)
+    assert r.t.scrolling
+    # ท่า 3 นิ้วที่หลุดจาก scroll ไม่ได้ทันที: ข้ามตรง ๆ ผ่าน SW (scroll_hold ต้องหลุดก่อน)
+    r.feed_for(SW, 0.6)
+    assert r.count("switcher_open") == 1
+    assert r.count("scroll_end") == 1 and not r.t.scrolling
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_not_opened_while_dragging(fps):
+    r = Rig(fps)
+    r.feed_for(_sw(pinch=0.02), 1.0)  # จีบ = drag
+    assert r.count("drag_start") == 1
+    assert r.count("switcher_open") == 0 and r.states[-1].mode == "drag"
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_not_opened_during_clutch_and_waits_after(fps):
+    r = Rig(fps)
+    r.feed_for(FIST, 0.4)
+    assert r.t.clutch
+    r.feed_for(SW, 0.25)  # ออกจาก clutch แล้วค่อยเริ่มนับ 0.3 s
+    assert r.count("switcher_open") == 0
+    r.feed_for(SW, 0.4)
+    assert r.count("switcher_open") == 1
+
+
+def test_switcher_not_opened_when_disabled():
+    r = Rig(30, enabled=False)
+    r.feed_for(SW, 1.0)
+    assert r.events() == [] and r.states[-1].mode == "off"
+
+
+def test_switcher_disabled_by_flag():
+    t = GestureTracker(GestureConfig(), switcher_enabled=False)
+    r = Rig(30)
+    r.t = t
+    r.feed_n(_g(facing=NORMAL_FACING), 62)
+    r.feed_for(_g(facing=FLIP_FACING), 1.2)
+    r.feed_n(_g(facing=NORMAL_FACING), 3)
+    r.log.clear()
+    r.feed_for(SW, 1.0)
+    assert r.count("switcher_open") == 0
+    # เปิดอยู่แล้วถูกปิดจากภายนอก → cancel
+    r2 = Rig(30)
+    _open_switcher(r2)
+    r2.t.switcher_enabled = False
+    r2.feed(SW)
+    assert _sw_events(r2) == ["switcher_cancel"]
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_blurry_frames_do_not_reset_entry_timer(fps):
+    r = Rig(fps)
+    start = r.ts
+    r.feed_for(SW, 0.1)
+    r.feed(BLUR)          # เฟรมเบลอเดี่ยว: gap ต่ำแค่เฟรมเดียว
+    r.feed_for(SEMI, 0.1)  # กึ่งท่า (gap 0.10 > hold) ก็ไม่รีเซ็ต
+    r.feed_for(SW, 0.25)
+    t_open = [t for t, e in r.log if e == "switcher_open"]
+    assert len(t_open) == 1
+    assert t_open[0] - start <= 0.3 + 0.1 + 3 / fps + 0.1 + 1e-6  # ไม่ต้องเริ่มนับใหม่ทั้งก้อน
+
+
+def test_switcher_entry_timer_resets_after_real_release():
+    r = Rig(30)
+    r.feed_for(SW, 0.2)
+    r.feed_for(NORMAL, 0.1)  # ปล่อยท่าจริง (หลายเฟรม)
+    r.feed_for(SW, 0.2)
+    assert r.count("switcher_open") == 0
+    r.feed_for(SW, 0.2)
+    assert r.count("switcher_open") == 1
+
+
+def test_normal_hand_never_opens_switcher():
+    r = Rig(30)
+    for f in (NORMAL, _g(pinky=0.95, idx=0.95, mid=0.95, ring=0.95), _g(pinky=0.84), SCROLL, PINCH):
+        r.feed_for(f, 1.5)
+    assert r.count("switcher_open") == 0
+    r2 = Rig(16)
+    r2.feed_for(_sw(pinky=0.95), 3.0)
+    assert r2.count("switcher_open") == 0
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_dx_sign_and_scale(fps):
+    r = Rig(fps)
+    _open_switcher(r, x=0.5)
+    assert r.states[-1].switcher_dx == pytest.approx(0.0, abs=1e-6)
+    # ขยับขวา 0.06 ของภาพ: 0.06*(4/3)/(0.4*0.2) = 1.0 การ์ด
+    st = r.feed_for(_sw(x=0.56), 0.5)
+    assert st.switcher_dx == pytest.approx(1.0, abs=0.01)
+    st = r.feed_for(_sw(x=0.44), 0.5)
+    assert st.switcher_dx == pytest.approx(-1.0, abs=0.01)
+    assert st.mode == "switcher"
+    assert _sw_events(r) == []
+
+
+def test_switcher_dx_uses_aspect_and_is_zero_when_closed():
+    r = Rig(30)
+    assert r.states[-1].switcher_dx == 0.0
+    ts = r.ts
+    for _ in range(16):  # aspect เดียวกันตลอด (1.0) ตั้งแต่ก่อนเปิด
+        ts += r.dt
+        st = r.t.update(SW, ts, aspect=1.0)
+    assert st.mode == "switcher"
+    ts += r.dt
+    st = r.t.update(_sw(x=0.56), ts, aspect=1.0)
+    assert st.switcher_dx == pytest.approx(0.06 / (0.4 * 0.2), abs=0.01)
+    st = r.t.update(None, ts + r.dt)
+    assert st.switcher_dx == 0.0
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+@pytest.mark.parametrize("pinky", [0.70, 0.68, 0.72])
+def test_switcher_blur_dropout_does_not_commit(fps, pinky):
+    r = Rig(fps)
+    _open_switcher(r)
+    blur = _sw(idx=0.46, mid=0.55, ring=0.9, pinky=pinky)
+    r.feed_for(blur, 0.25)
+    r.feed_for(_sw(idx=0.5, mid=0.5, ring=0.5, pinky=pinky), 0.15)  # รวม ~0.4 s < 0.6 s
+    assert _sw_events(r) == []
+    assert not [e for e in r.events() if e.startswith("click")]
+    r.feed_for(SW, 0.3)
+    assert _sw_events(r) == [] and r.states[-1].mode == "switcher"
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_pinky_reextend_commits_after_exit_time(fps):
+    r = Rig(fps)
+    _open_switcher(r)
+    t_first = r.ts + r.dt
+    r.feed_for(NORMAL, 0.1)
+    assert _sw_events(r) == []  # ยังไม่ถึง 0.15 s
+    r.feed_for(NORMAL, 0.3)
+    assert _sw_events(r) == ["switcher_commit"]
+    t_commit = [t for t, e in r.log if e == "switcher_commit"][0]
+    assert 0.15 - 1e-6 <= t_commit - t_first <= 0.15 + 2 / fps
+    assert r.states[-1].mode == "move"
+
+
+def test_switcher_single_open_pinky_frame_does_not_commit():
+    r = Rig(30)
+    _open_switcher(r)
+    r.feed(NORMAL)
+    r.feed_for(SW, 0.3)
+    assert _sw_events(r) == []
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_fist_commits(fps):
+    r = Rig(fps)
+    _open_switcher(r)
+    r.feed_for(FIST, 0.1)
+    assert _sw_events(r) == []
+    r.feed_for(FIST, 0.3)
+    assert _sw_events(r) == ["switcher_commit"]
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_lost_pose_fallback_commits_after_0_6s(fps):
+    r = Rig(fps)
+    _open_switcher(r)
+    t_last_pose = r.ts
+    r.feed_for(AMBIG, 0.5)
+    assert _sw_events(r) == []
+    r.feed_for(AMBIG, 0.3)
+    assert _sw_events(r) == ["switcher_commit"]
+    t_commit = [t for t, e in r.log if e == "switcher_commit"][0]
+    assert 0.6 - 1e-6 <= t_commit - t_last_pose <= 0.6 + 1.5 / fps
+
+
+def test_switcher_semi_pose_frames_keep_fallback_alive():
+    r = Rig(30)
+    _open_switcher(r)
+    r.feed_for(AMBIG, 0.4)
+    r.feed(SEMI)  # gap 0.10 > 0.08 → ยังอยู่ในท่า
+    r.feed_for(AMBIG, 0.4)
+    assert _sw_events(r) == []
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_flip_cancels(fps):
+    r = Rig(fps)
+    _open_switcher(r)
+    r.feed_for(_sw(facing=r.flip), 0.3)  # พลิกค้าง >= 0.25 s จึงยกเลิก
+    assert _sw_events(r) == ["switcher_cancel"] and r.states[-1].mode == "flip"
+    r.feed_for(_sw(facing=r.flip), 0.2)
+    assert _sw_events(r) == ["switcher_cancel"]  # ไม่ซ้ำ
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_brief_flip_during_swipe_does_not_cancel(fps):
+    r = Rig(fps)
+    _open_switcher(r)
+    for _ in range(4):  # ข้อมือบิด ~0.13 s ตอนสะบัด (facing +0.7)
+        st = r.feed(_sw(facing=0.7))
+        assert st.mode == "switcher"  # ยังไม่รายงาน flip
+    r.feed_for(SW, 0.3)
+    assert _sw_events(r) == [] and r.states[-1].mode == "switcher"
+    # พลิกจริงค้าง 0.3 s ยังยกเลิก
+    r.feed_for(_sw(facing=0.7), 0.3)
+    assert _sw_events(r) == ["switcher_cancel"]
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_false_open_from_scroll_entry_gap(fps):
+    # log 20261026-215533: gap > 0.15 แค่ 3 เฟรมแล้วค้างที่ 0.06–0.11 (เข้า scroll) ต้องไม่เปิด
+    r = Rig(fps)
+    r.feed_n(_sw(idx=0.95, mid=0.95, ring=0.95, pinky=0.78), 3)   # gap 0.17
+    mid_gap = _sw(idx=0.95, mid=0.95, ring=0.90, pinky=0.80)      # gap 0.10
+    r.feed_for(mid_gap, 1.0)
+    assert r.count("switcher_open") == 0
+    # ท่าจริงที่ gap เกินเกณฑ์ ~73% ของเฟรม (สลับกับ 0.10) ยังเปิดได้
+    r2 = Rig(fps)
+    for i in range(int(fps * 0.8)):
+        r2.feed(SW if i % 4 != 3 else mid_gap)
+    assert r2.count("switcher_open") == 1
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_no_commit_right_after_minimize_swipe_then_commit_when_settled(fps):
+    r = Rig(fps)
+    _open_switcher(r, y=0.7)
+    y = _stroke(r, 0.7, -1)
+    assert _sw_events(r) == ["switcher_minimize"]
+    # ระหว่าง/หลังสะบัดนิ้วดูเหมือนมือปกติ (ก้อย 0.95) 0.3 s: ไม่ commit
+    r.feed_for(_sw(y=y, idx=0.95, mid=0.95, ring=0.95, pinky=0.95), 0.3)
+    assert _sw_events(r) == ["switcher_minimize"]
+    # มือปกติค้างต่อหลังพ้นช่วง settle → commit ครั้งเดียว
+    r.feed_for(_sw(y=y, pinky=0.95), 0.8)
+    assert _sw_events(r) == ["switcher_minimize", "switcher_commit"]
+
+
+def test_switcher_hand_lost_cancels_once_and_reopens_after_rehold():
+    r = Rig(30)
+    _open_switcher(r)
+    st = r.t.update(None, r.ts + 0.1)
+    assert st.events == ("switcher_cancel",) and st.mode == "move"
+    assert r.t.update(None, r.ts + 0.2).events == ()
+    r.ts += 0.3
+    r.feed_for(SW, 0.2)
+    assert r.count("switcher_open") == 0
+    r.feed_for(SW, 0.3)
+    assert r.count("switcher_open") == 1
+
+
+def test_switcher_disable_cancels_exactly_once():
+    r = Rig(30)
+    _open_switcher(r)
+    ev = r.t.disable()
+    assert ev.count("switcher_cancel") == 1 and "toggle_off" in ev
+    assert r.t.disable() == []
+    st = r.feed(SW)
+    assert st.events == () and st.mode == "off"
+    assert not r.t.switcher_open
+
+
+def test_switcher_toggle_request_cancels_once():
+    r = Rig(30)
+    _open_switcher(r)
+    r.t.request_toggle()
+    st = r.feed(SW)
+    assert st.events.count("switcher_cancel") == 1 and "toggle_off" in st.events
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_swipe_up_minimizes_once_and_return_stroke_is_ignored(fps):
+    r = Rig(fps)
+    _open_switcher(r, x=0.5, y=0.7)
+    y = _stroke(r, 0.7, -1, drift=0.02)
+    assert _sw_events(r) == ["switcher_minimize"]
+    # x ที่ลอยระหว่างสะบัดไม่ขยับ carousel (rebase)
+    r.feed_for(_sw(x=0.52, y=y), 0.3)  # ตีกลับที่ ~0.5–0.7 s หลังเริ่มสะบัด (ภายใน 0.8 s)
+    assert r.states[-1].switcher_dx == pytest.approx(0.0, abs=0.05)
+    _stroke(r, y, +1, x=0.52)  # มือตีกลับลงภายใน 0.8 s
+    r.feed_for(_sw(x=0.52, y=0.7), 0.3)
+    assert _sw_events(r) == ["switcher_minimize"]
+    assert r.states[-1].mode == "switcher"
+
+
+def test_switcher_long_swipe_up_fires_once():
+    r = Rig(30)
+    _open_switcher(r, y=0.9)
+    for i in range(1, 9):  # สะบัดต่อเนื่อง 8 เฟรม
+        r.feed(_sw(y=0.9 - 0.05 * i))
+    assert _sw_events(r) == ["switcher_minimize"]
+
+
+def test_switcher_second_swipe_up_after_rearm():
+    r = Rig(30)
+    _open_switcher(r, y=0.9)
+    y = _stroke(r, 0.9, -1)
+    r.feed_for(_sw(y=y), 0.3)
+    y = _stroke(r, y + 0.0, -1)
+    assert _sw_events(r) == ["switcher_minimize", "switcher_minimize"]
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_swipe_down_cancels(fps):
+    r = Rig(fps)
+    _open_switcher(r, y=0.3)
+    _stroke(r, 0.3, +1)
+    assert _sw_events(r) == ["switcher_cancel"]
+    assert r.states[-1].mode == "move"
+
+
+def test_switcher_swipe_down_after_refractory_cancels():
+    r = Rig(30)
+    _open_switcher(r, y=0.7)
+    y = _stroke(r, 0.7, -1)
+    r.feed_for(_sw(y=y), 1.0)  # เกิน 0.8 s
+    _stroke(r, y, +1)
+    assert _sw_events(r) == ["switcher_minimize", "switcher_cancel"]
+
+
+def test_switcher_slow_vertical_and_horizontal_moves_do_not_swipe():
+    r = Rig(30)
+    _open_switcher(r, x=0.3, y=0.5)
+    for i in range(1, 31):  # ขยับซ้าย-ขวาเร็ว ๆ (vx ~ 5)
+        r.feed(_sw(x=0.3 + 0.01 * i * (1 if i < 15 else -1), y=0.5))
+    for i in range(1, 31):  # ขยับขึ้นช้า ๆ ~1.5 ขนาดมือ/วิ
+        r.feed(_sw(y=0.5 - 0.01 * i))
+    assert _sw_events(r) == []
+    # สะบัดเฉียงที่แนวนอนเด่นกว่า (|vy| < 1.5|vx|) ไม่นับ
+    for i in range(1, 5):
+        r.feed(_sw(x=0.5 + 0.08 * i, y=0.2 - 0.05 * i))
+    assert _sw_events(r) == []
+
+
+@pytest.mark.parametrize("fps", SW_FPS)
+def test_switcher_cannot_reopen_until_pose_released(fps):
+    r = Rig(fps)
+    _open_switcher(r, y=0.3)
+    _stroke(r, 0.3, +1)  # cancel ระหว่างที่ยังทำท่าอยู่
+    assert _sw_events(r) == ["switcher_cancel"]
+    r.feed_for(_sw(y=0.7), 1.0)  # ค้างท่าต่อ → ต้องไม่เปิดซ้ำ
+    assert _sw_events(r) == ["switcher_cancel"]
+    r.feed_n(NORMAL, 3)  # ปล่อยท่า
+    r.feed_for(SW, 0.6)
+    assert _sw_events(r) == ["switcher_cancel", "switcher_open"]
+
+
+def test_switcher_cannot_reopen_after_commit_while_holding_fist_pose_then_ok():
+    r = Rig(30)
+    _open_switcher(r)
+    r.feed_for(NORMAL, 0.4)
+    assert _sw_events(r) == ["switcher_commit"]
+    r.feed_for(SW, 0.6)  # ปล่อยท่าแล้ว (NORMAL หลายเฟรม) → เปิดใหม่ได้
+    assert _sw_events(r)[-1] == "switcher_open"
+
+
+def test_switcher_mode_blocks_clicks_and_clutch():
+    r = Rig(30)
+    _open_switcher(r)
+    r.feed_for(_sw(idx=0.6, pinky=0.76), 0.2)   # ชี้งอ (ปกติ = คลิก)
+    r.feed_for(SW, 0.2)
+    assert [e for e in r.events() if e.startswith(("click", "clutch", "drag", "scroll"))] == []
+    assert r.states[-1].mode == "switcher"

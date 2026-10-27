@@ -50,6 +50,7 @@ _MODE_LABELS = {
 
 POSE_LABELS = {
     "flip": "พลิกมือ (เปิด/ปิด)",
+    "switcher": "สามนิ้ว (สลับหน้าต่าง)",
     "pinch": "จีบ (ลาก)",
     "fist": "กำมือ (clutch)",
     "scroll": "สองนิ้ว (scroll)",

@@ -1,6 +1,7 @@
-"""ตรวจท่ามือ: toggle (พลิกมือ), clutch, drag, scroll, click (pure logic)
+"""ตรวจท่ามือ: toggle (พลิกมือ), switcher (3 นิ้ว), clutch, drag, scroll, click (pure logic)
 
-ลำดับความสำคัญเมื่อท่าชนกัน: flip (ปลอดภัยสุด: ตัด drag/scroll) > drag > clutch > scroll > click
+ลำดับความสำคัญเมื่อท่าชนกัน: flip (ปลอดภัยสุด: ตัด drag/scroll/switcher) > switcher > drag > clutch
+> scroll > click
 """
 from __future__ import annotations
 
@@ -28,6 +29,20 @@ CLICK_PINCH_MARGIN = 0.003  # คลิกต้อง pinch > pinch_down + marg
 SCROLL_HOLD_MIDDLE = 0.55    # ค้าง scroll: นิ้วกลางต่ำได้ถึงเท่านี้
 SCROLL_HOLD_RP_MARGIN = 0.07  # ค้าง scroll: นาง/ก้อยเหยียดขึ้นได้เกิน scroll_curl_max เท่านี้
 PINCH_MEDIAN_N = 5     # median ของระยะจีบกี่เฟรม (~0.3 s ที่ 16 fps) ตัดค่ากระโดดเฟรมเดียว
+# ---- ตัวสลับหน้าต่าง (ท่า 3 นิ้ว) ค่าจาก log มือจริงของผู้ใช้ (ห้องมืด ~16–30 fps) ----
+SWITCHER_EXIT_S = 0.15          # เลิกท่าอย่างชัดเจน (ก้อยเหยียด/กำมือ) ค้างเท่านี้จึง commit
+SWITCHER_LOST_POSE_S = 0.6      # ไม่มีเฟรมไหนอยู่ในท่าเลยนานเท่านี้ → commit (เลิกท่าด้วยวิธีอื่น)
+SWITCHER_SWIPE_REFRACTORY_S = 0.8  # หลังสะบัด: ไม่รับสะบัดทิศตรงข้าม (ท่าสะบัดขึ้นมีมือตีกลับลง 0.45–0.7 s)
+SWITCHER_SWIPE_WINDOW_S = 0.15  # หน้าต่างวัดความเร็ว anchor
+SWITCHER_SWIPE_RATIO = 1.5      # |vy| ต้องมากกว่า |vx| เท่านี้เท่า
+SWITCHER_SWIPE_MIN_DT = 0.05    # หน้าต่างสั้นกว่านี้ไม่คิดความเร็ว (noise)
+SWITCHER_PINKY_CLOSE = 0.06     # ก้อยเหยียด "เลิกท่า" ต้อง gap ต่ำกว่านี้ด้วย
+SWITCHER_FIST_PINKY_MARGIN = 0.10  # กำมือจริงเพื่อ commit: ก้อยต้องต่ำกว่า curl_down อีกเท่านี้
+# (motion blur ทำให้ชี้/กลาง/นางตกต่ำ ส่วนก้อยในท่าจริงอยู่ที่ 0.68–0.72 อยู่แล้ว จึงใช้ is_fist ตรง ๆ ไม่ได้)
+SWITCHER_OPEN_POSE_FRAC = 0.6   # เปิดได้ต่อเมื่อเฟรมในช่วง hold เป็นท่า 3 นิ้ว (gap > gap_on) อย่างน้อยเท่านี้
+SWITCHER_FLIP_CANCEL_S = 0.25   # switcher เปิดอยู่: พลิกมือยืนยันค้างเท่านี้จึงยกเลิก (สะบัดทำข้อมือบิดสั้น ๆ)
+SWITCHER_SWIPE_SETTLE_S = 0.5   # หลังสะบัดย่อ: พักการตรวจ commit เท่านี้ (นิ้วดูเหมือนมือปกติระหว่างสะบัด)
+SWITCHER_HAND_EMA = 0.1        # EMA ของขนาดมือ (ทำสเกลระยะเลื่อนให้นิ่ง)
 
 
 def _clamp01(v: float) -> float:
@@ -57,9 +72,21 @@ def is_fist(c: dict[str, float], cfg: GestureConfig) -> bool:
     return all(c[n] < cfg.curl_down for n in FOUR)
 
 
+def switcher_gap(c: dict[str, float]) -> float:
+    """min(ชี้, กลาง, นาง) - ก้อย : ท่า 3 นิ้ว gap เป็นบวกชัด (median +0.20), มือปกติ ~0"""
+    return min(c["index"], c["middle"], c["ring"]) - c["pinky"]
+
+
+def is_switcher_pose(c: dict[str, float], cfg: GestureConfig) -> bool:
+    """3 นิ้ว (ชี้+กลาง+นาง เหยียด ก้อยพับ); กำมือไม่ใช่ท่านี้เสมอ"""
+    return (switcher_gap(c) > cfg.switcher_gap_on
+            and c["index"] > cfg.curl_down and c["middle"] > cfg.curl_down
+            and c["ring"] > cfg.curl_down)
+
+
 def is_scroll_pose(c: dict[str, float], cfg: GestureConfig) -> bool:
     return (c["index"] > cfg.scroll_extend_min and c["middle"] > cfg.scroll_extend_min
-            and _rp_mean(c) < cfg.scroll_curl_max)
+            and _rp_mean(c) < cfg.scroll_curl_max and not is_switcher_pose(c, cfg))
 
 
 def is_scroll_hold(c: dict[str, float], cfg: GestureConfig) -> bool:
@@ -86,6 +113,8 @@ def raw_pose(feats: HandFeatures, cfg: GestureConfig, normal_sign: int) -> str:
     c = feats.curl
     if is_flip(getattr(feats, "palm_facing", 0.0), normal_sign, cfg):
         return "flip"
+    if is_switcher_pose(c, cfg):
+        return "switcher"
     if is_pinch(feats.pinch, cfg):
         return "pinch"
     if is_fist(c, cfg):
@@ -107,7 +136,7 @@ class GestureState:
     open_palm: bool                    # เก็บไว้เพื่อความเข้ากันได้: = flipped
     fist: bool
     events: tuple[str, ...] = ()
-    mode: str = "off"                  # "off" | "move" | "flip" | "clutch" | "drag" | "scroll"
+    mode: str = "off"                  # "off" | "move" | "flip" | "switcher" | "clutch" | "drag" | "scroll"
     click_bend_ts: float | None = None  # เวลาที่นิ้วเริ่มพับของคลิก (มีค่าเฉพาะเฟรมที่เกิด click)
     index_progress: float = 0.0        # 0..1 ใกล้ถึงเกณฑ์คลิก
     middle_progress: float = 0.0
@@ -115,12 +144,36 @@ class GestureState:
     flipped: bool = False              # พลิกมือ (ยืนยัน confirm_frames แล้ว)
     normal_sign: int = 0               # เครื่องหมาย facing ด้านปกติ (0 = ยังไม่เรียนรู้)
     learning: bool = False             # กำลังเรียนรู้ด้านปกติ (toggle ยังไม่ทำงาน)
+    # ระยะเลื่อนมือแนวนอนตั้งแต่เปิด switcher หน่วย "การ์ด" (+ = มือไปทางขวาในภาพ mirror = การ์ดถัดไป)
+    # มีค่าเฉพาะตอน switcher เปิด (นอกนั้น 0.0)
+    switcher_dx: float = 0.0
 
 
 class GestureTracker:
-    def __init__(self, cfg: GestureConfig) -> None:
+    def __init__(self, cfg: GestureConfig, switcher_enabled: bool = True) -> None:
         self.cfg = cfg
         self.enabled = False
+        # --- switcher (3 นิ้ว) ---
+        self.switcher_enabled = switcher_enabled  # ตั้งจาก [switcher] enabled / เมนู tray ได้ตลอด
+        self.switcher_open = False
+        self._sw_enter_t: float | None = None  # เวลาที่เริ่มนับค้างท่าเพื่อเปิด
+        self._sw_pose_n = 0       # เฟรมติดกันที่เป็นท่า 3 นิ้ว (ก่อนเริ่มนับเวลา)
+        self._sw_low_n = 0        # เฟรมติดกันที่ gap <= hold (ระหว่างนับเวลาเปิด)
+        self._sw_need_release = False  # ปิดไปแล้ว ต้องปล่อยท่าก่อนจึงเปิดซ้ำได้
+        self._sw_rel_n = 0
+        self._sw_x0 = 0.0         # anchor x (แก้ aspect แล้ว) ตอนเปิด/หลัง rebase
+        self._sw_size = 0.2       # EMA ขนาดมือ
+        self._sw_hist: deque[tuple[float, float, float]] = deque()  # (ts, x*aspect, y)
+        self._sw_last_pose = 0.0  # เวลาล่าสุดที่ gap > hold
+        self._sw_exit_start: float | None = None
+        self._sw_exit_n = 0
+        self._sw_win: deque[tuple[float, bool]] = deque()  # (ts, is_switcher_pose) ในช่วง hold ล่าสุด
+        self._sw_flip_t: float | None = None  # เริ่มพลิกมือ (ขณะ switcher เปิด)
+        self._sw_flip_defer = False  # พลิกยังไม่ครบ SWITCHER_FLIP_CANCEL_S: ยังไม่ยกเลิก
+        self._sw_armed = True     # สะบัดได้ครั้งเดียวต่อหนึ่งการสะบัด
+        self._sw_freeze: float | None = None  # dx ที่ตรึงไว้ระหว่างสะบัดย่อ
+        self._sw_swipe_dir = 0    # ทิศสะบัดล่าสุด (-1 ขึ้น / +1 ลง)
+        self._sw_swipe_ts = -1e9
         self.clutch = False
         self.dragging = False
         self.scrolling = False
@@ -173,14 +226,20 @@ class GestureTracker:
         if self.scrolling:
             self.scrolling = False
             events.append("scroll_end")
+        self._sw_close(events, "switcher_cancel")  # ปิด switcher แบบยกเลิก (ครั้งเดียว)
+        self._sw_enter_t = None  # ที่นับค้างท่าเพื่อเปิดอยู่ก็ล้าง
+        self._sw_pose_n = self._sw_low_n = 0
+        self._sw_win.clear()
         self._pinch_n = self._pinch_rel_n = 0
         self._scroll_n = self._scroll_off_n = 0
 
     def _mode(self) -> str:
         if not self.enabled:
             return "off"
-        if self._flip_raw:
+        if self._flip_raw and not self._sw_flip_defer:
             return "flip"
+        if self.switcher_open:
+            return "switcher"
         if self.dragging:
             return "drag"
         if self.clutch:
@@ -197,6 +256,8 @@ class GestureTracker:
         self._flip_raw = False
         self._flip_n = 0
         self._flip_start = None
+        self._sw_flip_t = None
+        self._sw_flip_defer = False
         self._fist_n = 0
         self._rel_n = 0
         if self.clutch:
@@ -204,6 +265,11 @@ class GestureTracker:
             events.append("clutch_off")
         self._end_actions(events)
         self._reset_click()
+        # มือหาย = ปล่อยท่าแล้ว (เปิด switcher ใหม่ได้เมื่อค้างท่าครบ) และล้างตัวนับเข้าท่า
+        self._sw_need_release = False
+        self._sw_rel_n = 0
+        self._sw_enter_t = None
+        self._sw_pose_n = self._sw_low_n = 0
 
     def _learn_sign(self, facing: float, ts: float) -> None:
         """เรียนรู้ด้านปกติ: หน้าต่าง ~2 s ของเฟรมที่ |facing| > 0.4 ต้องเห็นด้านเดียวกัน >= 80%
@@ -261,8 +327,11 @@ class GestureTracker:
         with self._req_lock:
             self._req_toggle = True
 
-    def update(self, feats: HandFeatures | None, ts: float) -> GestureState:
+    def update(self, feats: HandFeatures | None, ts: float,
+               aspect: float = 4 / 3) -> GestureState:
+        """aspect = กว้าง/สูงของภาพ ใช้แก้ระยะ x ของ anchor (hand_size แก้มาแล้ว) สำหรับ switcher_dx"""
         cfg = self.cfg
+        sw_dx = 0.0
         events: list[str] = []
         with self._req_lock:
             requested, self._req_toggle = self._req_toggle, False
@@ -291,6 +360,14 @@ class GestureTracker:
         # --- พลิกมือค้าง → toggle (ทำงานเมื่อเรียนรู้ด้านปกติแล้วเท่านั้น) ---
         flip_raw = is_flip(facing, self.normal_sign, cfg)
         self._flip_raw = flip_raw
+        # switcher เปิดอยู่: พลิกสั้น ๆ (ข้อมือบิดตอนสะบัด) ยังไม่ยกเลิก ต้องค้างครบ SWITCHER_FLIP_CANCEL_S
+        self._sw_flip_defer = False
+        if flip_raw and self.switcher_open and self.enabled:
+            if self._sw_flip_t is None or ts < self._sw_flip_t:
+                self._sw_flip_t = ts
+            self._sw_flip_defer = ts - self._sw_flip_t < SWITCHER_FLIP_CANCEL_S
+        elif not flip_raw:
+            self._sw_flip_t = None
         self._flip_n = self._flip_n + 1 if flip_raw else 0
         flipped = self._flip_n >= cfg.confirm_frames
         progress = 0.0
@@ -326,28 +403,210 @@ class GestureTracker:
             self._end_actions(events)  # toggle off ระหว่างลาก/scroll → ปล่อยทันที
             self._reset_click()
             fist = False
-        elif flip_raw:
+        elif flip_raw and not self._sw_flip_defer:
             # กำลังพลิกข้อมือ: anchor เลื่อนเพราะการหมุน → ตัด drag/scroll, ไม่เริ่มอะไรใหม่, ไม่คลิก
             self._end_actions(events)
             self._fist_n = self._rel_n = 0
             self._reset_click()
             fist = self.clutch
+        elif self.switcher_open:
+            # switcher เปิดอยู่: ไม่ประมวลผลคลิก/drag/clutch/scroll เลย
+            fist = False
+            sw_dx = self._update_switcher(feats, ts, aspect, events)
         else:
             self._update_drag(pinch, events)
             self._update_clutch(c, fist_raw, events)
             fist = self.clutch or fist_raw
-            self._update_scroll(c, events)
-            if self._mode() != "move":
-                self._reset_click()
+            self._update_switcher_entry(feats, ts, aspect, events)
+            if self.switcher_open:
+                fist = False
             else:
-                # คลิกใช้ระยะดิบ (ชุดเดียวกับ raw_pose): เริ่มจีบต้องยกเลิกคลิกที่รออยู่ทันที
-                click_ts = self._update_clicks(c, feats.pinch, ts, events)
+                self._update_scroll(c, events)
+                if self._mode() != "move":
+                    self._reset_click()
+                else:
+                    # คลิกใช้ระยะดิบ (ชุดเดียวกับ raw_pose): เริ่มจีบต้องยกเลิกคลิกที่รออยู่ทันที
+                    click_ts = self._update_clicks(c, feats.pinch, ts, events)
 
         return GestureState(self.enabled, self.clutch, progress, flipped, fist, tuple(events),
                             mode=self._mode(), click_bend_ts=click_ts,
                             index_progress=idx_prog, middle_progress=mid_prog,
                             pinch_progress=pinch_prog, flipped=flipped,
-                            normal_sign=self.normal_sign, learning=self.learning)
+                            normal_sign=self.normal_sign, learning=self.learning,
+                            switcher_dx=sw_dx)
+
+    # ---- switcher (ท่า 3 นิ้ว) ----
+    def _sw_close(self, events: list[str], name: str) -> None:
+        """ปิด switcher ด้วย event name ("switcher_commit" / "switcher_cancel"); ไม่ทำอะไรถ้าไม่ได้เปิด"""
+        if not self.switcher_open:
+            return
+        self.switcher_open = False
+        events.append(name)
+        self._sw_need_release = True  # ต้องปล่อยท่าก่อนเปิดซ้ำ
+        self._sw_rel_n = 0
+        self._sw_enter_t = None
+        self._sw_pose_n = self._sw_low_n = 0
+        self._sw_hist.clear()
+        self._sw_exit_start = None
+        self._sw_exit_n = 0
+
+    def _update_switcher_entry(self, feats: HandFeatures, ts: float, aspect: float,
+                               events: list[str]) -> None:
+        """ท่า 3 นิ้วค้าง switcher_hold_ms → เปิด; เฟรมเบลอเดี่ยว ๆ (gap > hold) ไม่ทำให้ตัวจับเวลารีเซ็ต"""
+        cfg = self.cfg
+        gap = switcher_gap(feats.curl)
+        if self._sw_need_release:
+            self._sw_rel_n = self._sw_rel_n + 1 if gap <= cfg.switcher_gap_hold else 0
+            if self._sw_rel_n >= cfg.confirm_frames:
+                self._sw_need_release = False
+                self._sw_rel_n = 0
+            self._sw_enter_t = None
+            self._sw_pose_n = self._sw_low_n = 0
+            self._sw_win.clear()
+            return
+        if not self.switcher_enabled or self.dragging or self.clutch:
+            self._sw_enter_t = None
+            self._sw_pose_n = self._sw_low_n = 0
+            self._sw_win.clear()
+            return
+        pose = is_switcher_pose(feats.curl, cfg)
+        win = self._sw_win
+        win.append((ts, pose))
+        while win and (ts - win[0][0] > cfg.switcher_hold_ms / 1000.0 or win[0][0] > ts):
+            win.popleft()
+        if pose:
+            self._sw_low_n = 0
+            self._sw_pose_n += 1
+            if self._sw_enter_t is None and self._sw_pose_n >= cfg.confirm_frames:
+                self._sw_enter_t = ts
+        elif gap > cfg.switcher_gap_hold:
+            self._sw_low_n = 0  # กึ่งท่า (เบลอ): ไม่เริ่มนับ แต่ไม่ล้างที่นับอยู่
+            self._sw_pose_n = 0
+        else:
+            self._sw_pose_n = 0
+            self._sw_low_n += 1
+            if self._sw_low_n >= cfg.confirm_frames:
+                self._sw_enter_t = None
+        if self._sw_enter_t is None:
+            return
+        if ts < self._sw_enter_t:  # เวลาย้อนหลัง: เริ่มนับใหม่
+            self._sw_enter_t = ts
+            return
+        if (ts - self._sw_enter_t) * 1000.0 >= cfg.switcher_hold_ms:
+            # กัน false open จากท่ากึ่ง ๆ ตอนเข้า scroll: ในช่วง hold ต้องเป็นท่า 3 นิ้วจริง >= 60% ของเฟรม
+            # และเฟรมที่เปิดต้องยังอยู่ในท่า (gap > hold)
+            win = self._sw_win
+            n_pose = sum(1 for _, p in win if p)
+            if (win and n_pose >= SWITCHER_OPEN_POSE_FRAC * len(win)
+                    and gap > cfg.switcher_gap_hold):
+                self._sw_open(feats, ts, aspect, events)
+
+    def _sw_open(self, feats: HandFeatures, ts: float, aspect: float, events: list[str]) -> None:
+        if self.scrolling:
+            self.scrolling = False
+            events.append("scroll_end")
+        self._reset_click()
+        self._scroll_n = self._scroll_off_n = 0
+        self.switcher_open = True
+        events.append("switcher_open")
+        self._sw_enter_t = None
+        self._sw_pose_n = self._sw_low_n = 0
+        self._sw_x0 = feats.anchor[0] * aspect
+        self._sw_size = feats.hand_size if feats.hand_size > 0 else 0.2
+        self._sw_hist.clear()
+        self._sw_hist.append((ts, self._sw_x0, feats.anchor[1]))
+        self._sw_last_pose = ts
+        self._sw_exit_start = None
+        self._sw_exit_n = 0
+        self._sw_armed = True
+        self._sw_freeze = None
+        self._sw_swipe_dir = 0
+        self._sw_swipe_ts = -1e9
+
+    def _sw_dx_of(self, xa: float) -> float:
+        return (xa - self._sw_x0) / (self.cfg.switcher_step * self._sw_size)
+
+    def _update_switcher(self, feats: HandFeatures, ts: float, aspect: float,
+                         events: list[str]) -> float:
+        """switcher เปิดอยู่: คืน switcher_dx; ตรวจสะบัด (ย่อ/ยกเลิก) และการเลิกท่า (commit)"""
+        cfg = self.cfg
+        if not self.switcher_enabled:
+            self._sw_close(events, "switcher_cancel")
+            return 0.0
+        c = feats.curl
+        gap = switcher_gap(c)
+        if feats.hand_size > 0:
+            self._sw_size += SWITCHER_HAND_EMA * (feats.hand_size - self._sw_size)
+        xa = feats.anchor[0] * aspect
+        y = feats.anchor[1]
+        hist = self._sw_hist
+        if hist and ts < hist[-1][0]:  # เวลาย้อนหลัง: ล้างประวัติความเร็ว
+            hist.clear()
+        hist.append((ts, xa, y))
+        while len(hist) > 1 and ts - hist[1][0] >= SWITCHER_SWIPE_WINDOW_S:
+            hist.popleft()
+        if self._sw_freeze is not None:
+            # ระหว่างสะบัดย่อ (จนมือนิ่ง) ตรึง dx ไว้ที่ค่าก่อนสะบัด x ที่ลอยจะไม่ขยับ carousel
+            self._sw_x0 = xa - self._sw_freeze * cfg.switcher_step * self._sw_size
+
+        # --- สะบัดขึ้น = ย่อการ์ด, สะบัดลง = ยกเลิก ---
+        t0, x0a, y0 = hist[0]
+        span = ts - t0
+        moving = False  # กำลังสะบัด/ขยับแนวตั้งเร็ว: พักการตรวจ commit
+        if span >= SWITCHER_SWIPE_MIN_DT:
+            size = max(self._sw_size, 1e-6)
+            vx = (xa - x0a) / size / span
+            vy = (y - y0) / size / span   # ภาพ y ชี้ลง: ขึ้น = ลบ
+            speed = cfg.switcher_swipe_speed
+            moving = abs(vy) > speed * 0.5
+            if abs(vy) < speed * 0.5:
+                self._sw_armed = True
+                self._sw_freeze = None
+            elif (self._sw_armed and abs(vy) > speed
+                  and abs(vy) > SWITCHER_SWIPE_RATIO * abs(vx)):
+                self._sw_armed = False  # ครั้งเดียวต่อหนึ่งการสะบัด (รวมที่ถูกเมินเพราะ refractory)
+                d = -1 if vy < 0 else 1
+                blocked = (self._sw_swipe_dir == -d
+                           and ts - self._sw_swipe_ts < SWITCHER_SWIPE_REFRACTORY_S)
+                if not blocked:
+                    self._sw_swipe_dir = d
+                    self._sw_swipe_ts = ts
+                    if d < 0:
+                        events.append("switcher_minimize")
+                        # คงระยะเลื่อนเดิมก่อนสะบัด (dx ของต้นหน้าต่าง) ไม่ให้ x ที่ลอยตอนสะบัดขยับ carousel
+                        prev_dx = self._sw_dx_of(x0a)
+                        self._sw_x0 = xa - prev_dx * cfg.switcher_step * self._sw_size
+                        self._sw_freeze = prev_dx
+                    else:
+                        self._sw_close(events, "switcher_cancel")
+                        return 0.0
+
+        # --- เลิกท่า → commit (เหมือนปล่อยปุ่ม Alt) ---
+        if moving or ts - self._sw_swipe_ts < SWITCHER_SWIPE_SETTLE_S:
+            # ระหว่างสะบัด/หลังสะบัดนิ้วดูเหมือนมือปกติ → ไม่ commit; ตัวนับทั้งหมดเริ่มใหม่หลังนิ่ง
+            self._sw_exit_n = 0
+            self._sw_exit_start = None
+            self._sw_last_pose = ts
+            return self._sw_dx_of(xa)
+        if gap > cfg.switcher_gap_hold:
+            self._sw_last_pose = ts
+        pinky_open = c["pinky"] > cfg.switcher_pinky_open and gap < SWITCHER_PINKY_CLOSE
+        fist = (is_fist(c, cfg)
+                and c["pinky"] < cfg.curl_down - SWITCHER_FIST_PINKY_MARGIN)
+        if pinky_open or fist:
+            self._sw_exit_n += 1
+            if self._sw_exit_start is None or ts < self._sw_exit_start:
+                self._sw_exit_start = ts
+            if (self._sw_exit_n >= cfg.confirm_frames
+                    and ts - self._sw_exit_start >= SWITCHER_EXIT_S):
+                self._sw_close(events, "switcher_commit")
+                return self._sw_dx_of(xa)
+        else:
+            self._sw_exit_n = 0
+            self._sw_exit_start = None
+        if ts - self._sw_last_pose >= SWITCHER_LOST_POSE_S or ts < self._sw_last_pose:
+            self._sw_close(events, "switcher_commit")
+        return self._sw_dx_of(xa)
 
     def _update_drag(self, pinch: float, events: list[str]) -> None:
         """จีบค้าง = drag (สำคัญสุด); ปล่อยเมื่อ pinch > pinch_up"""
@@ -403,6 +662,9 @@ class GestureTracker:
         cfg = self.cfg
         if self.dragging or self.clutch:
             self._scroll_n = 0
+            return
+        if self._sw_enter_t is not None and not self.scrolling:
+            self._scroll_n = 0  # กำลังนับค้างท่า 3 นิ้ว: ไม่เริ่ม scroll
             return
         pose = is_scroll_pose(c, cfg)
         if not self.scrolling:

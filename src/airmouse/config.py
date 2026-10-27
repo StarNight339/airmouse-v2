@@ -51,7 +51,11 @@ class GestureConfig:
     confirm_frames: int = 2
     toggle_hold_ms: int = 700
     switcher_hold_ms: int = 300
-    switcher_step: float = 0.6
+    switcher_step: float = 0.4  # hand-size ต่อการ์ด (ช่วงมือสบาย ~2.0 → ถึงการ์ดที่ 5+)
+    switcher_gap_on: float = 0.15    # เข้า: min(ชี้,กลาง,นาง) - ก้อย ต้องเกินนี้
+    switcher_gap_hold: float = 0.08  # ค้างท่า: gap ต้องเกินนี้จึงนับว่ายังอยู่ในท่า
+    switcher_pinky_open: float = 0.88  # ก้อยเหยียดเกินนี้ (และ gap ต่ำ) = เลิกท่า
+    switcher_swipe_speed: float = 6.0  # สะบัดขึ้น/ลง: |vy| เกินนี้ (hand-size/s)
     min_presence: float = 0.6
     flip_facing_min: float = 0.5
     normal_facing: int = 0  # ด้านปกติของมือ: -1 / +1 หรือ 0 = เรียนรู้เอง
@@ -81,12 +85,19 @@ class SnapConfig:
 
 
 @dataclass
+class SwitcherConfig:
+    enabled: bool = True         # ท่า 3 นิ้วเปิดตัวสลับหน้าต่าง
+    preview: bool = True         # แสดงภาพตัวอย่างหน้าต่างในการ์ด
+
+
+@dataclass
 class Config:
     camera: CameraConfig = field(default_factory=CameraConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     gesture: GestureConfig = field(default_factory=GestureConfig)
     app: AppConfig = field(default_factory=AppConfig)
     snap: SnapConfig = field(default_factory=SnapConfig)
+    switcher: SwitcherConfig = field(default_factory=SwitcherConfig)
 
 
 _CHOICES = {
