@@ -200,6 +200,11 @@ class Controller:
             self.finder.set_active(True)
         return out
 
+    @property
+    def snap_virtual(self) -> tuple[float, float] | None:
+        """ตำแหน่ง virtual (ตามมือ ไม่รวมแรงดูด) ของเฟรมล่าสุด; None ถ้าไม่ได้ snap"""
+        return self._snap_prev
+
     def _snap_off(self) -> None:
         if self.hovered is not None or self._snap_prev is not None:
             if self.snapper is not None:
@@ -210,11 +215,27 @@ class Controller:
             self.finder.set_active(False)
 
 
+def _cursor_record(controller: Controller | None, target: tuple[float, float] | None,
+                   speed: float) -> dict | None:
+    """ข้อมูล cursor/snap ของเฟรมนี้สำหรับ pose log (ไว้จูน snap จากข้อมูลจริง)"""
+    if controller is None or target is None:
+        return None
+    rec: dict = {"cur": [round(target[0], 1), round(target[1], 1)], "spd": round(speed, 3)}
+    if controller.snap_virtual is not None:
+        rec["virt"] = [round(v, 1) for v in controller.snap_virtual]
+    hov = controller.hovered
+    if hov is not None:
+        rec["snap"] = [hov.left, hov.top, hov.right, hov.bottom]
+    return rec
+
+
 class PoseRecorder:
     """บันทึก landmark ทั้ง 21 จุดทุกเฟรมเป็น JSONL (--log-pose) ไว้ replay/จูนท่ามือทีหลัง
 
     บรรทัดละเฟรม: t, aspect, mirror และถ้าเห็นมือ: hand, score, lm (พิกัดภาพ x,y,z),
     world (เมตร) รวมถึง mode/ev ของ GestureTracker; เฟรมที่ไม่เห็นมือมี hand = null
+    เฟรมที่คุม cursor: cur (ตำแหน่งที่แสดง), spd (ความเร็วมือ hand-size/s) และตอน snap:
+    virt (ตำแหน่ง virtual), snap (กรอบปุ่มที่เกาะ left, top, right, bottom)
     """
 
     def __init__(self, path):
@@ -223,7 +244,7 @@ class PoseRecorder:
         self._fh = open(path, "w", encoding="utf-8", buffering=1)
 
     def write(self, ts: float, aspect: float, mirror: bool, hand: TrackedHand | None,
-              gesture: GestureState | None) -> None:
+              gesture: GestureState | None, cursor: dict | None = None) -> None:
         rec: dict = {"t": round(ts, 4), "aspect": round(aspect, 4), "mirror": mirror,
                      "hand": None}
         if hand is not None:
@@ -234,6 +255,8 @@ class PoseRecorder:
             )
         if gesture is not None:
             rec.update(mode=gesture.mode, ev=list(gesture.events))
+        if cursor:
+            rec.update(cursor)
         self._fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
     def close(self) -> None:
@@ -333,7 +356,8 @@ class InferenceThread(threading.Thread):
                 with self._lock:
                     self._latest = result
                 if recorder is not None:
-                    recorder.write(ts, w / h, self._mirror, hand, gesture)
+                    recorder.write(ts, w / h, self._mirror, hand, gesture,
+                                   _cursor_record(self._controller, target, speed))
                     if feats is not None:
                         log.debug("pose t=%.3f %s", ts, _describe_pose(feats, gesture))
                 if stats is not None:

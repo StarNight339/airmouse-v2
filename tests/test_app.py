@@ -572,6 +572,21 @@ def test_pose_recorder_writes_jsonl_and_replays(tmp_path):
     t.update(None, b["t"])
 
 
+def test_cursor_record_includes_snap_state():
+    from types import SimpleNamespace
+
+    from airmouse.app import _cursor_record
+
+    ctrl = SimpleNamespace(snap_virtual=None, hovered=None)
+    assert _cursor_record(None, (1.0, 2.0), 0.5) is None
+    assert _cursor_record(ctrl, None, 0.5) is None
+    assert _cursor_record(ctrl, (10.04, 20.0), 0.12345) == {"cur": [10.0, 20.0], "spd": 0.123}
+    ctrl = SimpleNamespace(snap_virtual=(12.0, 21.0),
+                           hovered=SimpleNamespace(left=0, top=1, right=30, bottom=31))
+    r = _cursor_record(ctrl, (10.0, 20.0), 0.2)
+    assert r["virt"] == [12.0, 21.0] and r["snap"] == [0, 1, 30, 31]
+
+
 def test_inference_thread_records_pose_when_enabled(tmp_path, monkeypatch, run_thread):
     from airmouse import config as config_mod
     monkeypatch.setattr(config_mod, "LOGS_DIR", tmp_path)
