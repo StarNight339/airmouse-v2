@@ -104,7 +104,7 @@ def test_click_takes_stricter_finger():
     s = make_samples()
     # กลางพับลึกกว่าชี้ → เกณฑ์ down ของกลางต่ำกว่า ต้องเลือกค่าที่ต่ำกว่า (เข้มกว่า)
     rng = random.Random(3)
-    s["fold_middle"] = [hf(.93, jitter(rng, .4, .01)) for _ in range(40)]
+    s["fold_middle"] = [hf(.93, jitter(rng, .5, .01)) for _ in range(40)]
     res = cal.compute(s, CUR)
     d_idx = cal.split_thresholds([f.curl["index"] for f in s["relaxed"]],
                                  [f.curl["index"] for f in s["fold_index"]])[0]
@@ -237,3 +237,55 @@ def test_session_restart_clears_current_pose():
     s.feed(1, hf())
     s.restart_prepare(1.5)
     assert s.phase == "prepare" and s.samples["a"] == []
+
+
+# ---------------------------------------------------------------- ตรวจด้วย predicate จริง (M2/M3)
+def test_barely_flip_is_a_problem():
+    s = make_samples()
+    s["flip"] = [hf(facing=0.12) for _ in range(40)]   # พลิกไม่สุด: is_flip ไม่เคยจริง
+    res = cal.compute(s, CUR)
+    assert "flip" in res.problems
+    assert ("gesture", "flip_facing_min") not in res.values
+
+
+def test_flip_unknown_normal_side_reports_relaxed():
+    s = make_samples()
+    s["relaxed"] = [hf(facing=0.05) for _ in range(40)]
+    res = cal.compute(s, GestureConfig(normal_facing=0))
+    assert "relaxed" in res.problems
+
+
+def test_mixed_old_new_click_vs_fist_is_a_problem():
+    s = make_samples()
+    del s["fist"]   # curl_down เดิม (0.70) ยังอยู่ แต่คลิกใหม่ต้องไม่ต่ำกว่านั้น
+    s["fold_index"] = [hf(.45, .6) for _ in range(40)]
+    s["fold_middle"] = [hf(.93, .45) for _ in range(40)]
+    res = cal.compute(s, CUR)
+    assert res.values.get(("gesture", "click_curl_down"), 1.0) > CUR.curl_down
+    assert res.problems
+    assert ("gesture", "click_curl_down") not in res.values
+    assert ("gesture", "click_curl_up") not in res.values
+
+
+def test_pose_failing_predicates_drops_its_keys():
+    s = make_samples()
+    rng = random.Random(5)
+    # ครึ่งหนึ่งของเฟรมกำมือ "หลวม" กว่าเกณฑ์ที่ได้ (p95 ดึงเกณฑ์ขึ้น แต่ยังตกเกณฑ์ is_fist ที่ ring)
+    s["three"] = [hf(.98, .98, .98, .6) for _ in range(10)] + \
+                 [hf(.98, .98, .98, .95) for _ in range(30)]
+    res = cal.compute(s, CUR)
+    assert "three" in res.problems
+    assert ("gesture", "switcher_gap_on") not in res.values
+    assert ("gesture", "switcher_gap_hold") not in res.values
+    assert ("gesture", "curl_down") in res.values
+
+
+def test_session_choose_hand():
+    s = cal.CalibrationSession(choose_hand=True, hand="left")
+    assert s.phase == "hand" and s.hand == "left"
+    assert not s.feed(1, hf())
+    assert not s.tick(100.0) and s.phase == "hand"
+    s.choose_hand("right", 5.0)
+    assert s.hand == "right" and s.phase == "prepare" and s.current.id == "relaxed"
+    with pytest.raises(ValueError):
+        s.choose_hand("both", 6.0)

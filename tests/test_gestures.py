@@ -96,6 +96,18 @@ def test_normal_sign_learned_for_either_hand(normal):
     assert not st.learning and st.normal_sign == (1 if normal > 0 else -1)
 
 
+def test_set_normal_facing_after_calibration():
+    t = GestureTracker(GestureConfig(normal_facing=-1))
+    assert t.normal_sign == -1
+    t.set_normal_facing(1)   # calibrate ได้ด้านใหม่ → มีผลทันที ไม่ต้องรีสตาร์ต
+    assert t.normal_sign == 1 and not t.learning
+    t.set_normal_facing(0)   # 0 = เรียนรู้ใหม่
+    assert t.learning
+    for i in range(16):
+        st = t.update(_g(facing=0.7), i * 0.1)
+    assert st.normal_sign == 1
+
+
 def test_weak_facing_frames_are_not_used_for_learning():
     t = GestureTracker(GestureConfig())
     for i in range(30):

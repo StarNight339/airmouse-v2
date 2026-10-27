@@ -9,7 +9,8 @@ from datetime import datetime
 import pytest
 
 from airmouse.ui.practice import (
-    ScrollHoldTracker, drag_success, hit_test, make_targets, save_results, summarize,
+    ScrollHoldTracker, drag_success, format_stage_line, hit_test, make_targets, needs_regen,
+    save_results, summarize,
 )
 
 
@@ -98,6 +99,20 @@ def test_summarize_empty_stage():
     s = summarize([])
     assert s["click"]["attempts"] == 0 and s["click"]["accuracy"] is None
     assert s["click"]["mean_time_s"] is None
+
+
+def test_format_stage_line_handles_none():
+    s = summarize([{"stage": "drag", "hit": False, "time_s": 2.0}])
+    line = format_stage_line("drag", s["drag"])
+    assert "0%" in line and "(0/1)" in line and "เฉลี่ย - วิ" in line
+    ok = summarize([{"stage": "scroll", "hit": True, "time_s": 1.234, "overshoots": 2}])
+    line = format_stage_line("scroll", ok["scroll"])
+    assert "1.23" in line and "เลยกรอบ 2" in line
+
+
+def test_needs_regen():
+    assert needs_regen((800.0, 600.0), (1920.0, 1080.0))
+    assert not needs_regen((1920.0, 1080.0), (1920.0, 1080.0))
 
 
 def test_save_results(tmp_path):

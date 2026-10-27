@@ -66,6 +66,17 @@ class HandTracker:
         )
         self._landmarker = vision.HandLandmarker.create_from_options(options)
 
+    @property
+    def hand(self) -> str:
+        return self._hand
+
+    @hand.setter
+    def hand(self, value: str) -> None:
+        """เปลี่ยนข้างมือระหว่างรัน (เช่นเลือกมือในหน้า calibrate) มีผลเฟรมถัดไป"""
+        if value in ("left", "right") and value != self._hand:
+            self._hand = value
+            self._last_anchor = None
+
     def process(self, rgb: np.ndarray, ts: float) -> TrackedHand | None:
         """rgb = ภาพ RGB (กลับด้านแล้วถ้า mirror), ts = timestamp ของเฟรม (วินาที)"""
         ms = int(ts * 1000)

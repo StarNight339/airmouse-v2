@@ -867,6 +867,29 @@ def test_inference_pause_disables_control_once_and_skips_controller():
     assert "toggle_off" in t.drain_events()
 
 
+def test_inference_reads_hand_side_every_frame():
+    import numpy as _np
+
+    cam = FakeCamera()
+    trk = FakeTracker()
+    trk.hand = "left"
+    side = {"v": "left"}
+    t = InferenceThread(cam, trk, False, False, hand_source=lambda: side["v"])
+    seen = []
+    orig = trk.process
+    trk.process = lambda rgb, ts: (seen.append(trk.hand), orig(rgb, ts))[1]
+    t.start()
+    cam.frames.append((_np.zeros((48, 64, 3), _np.uint8), 1.0))
+    import time as _t
+    _t.sleep(0.15)
+    side["v"] = "right"     # หน้า calibrate เลือกมือขวา
+    cam.frames.append((_np.zeros((48, 64, 3), _np.uint8), 1.033))
+    _t.sleep(0.15)
+    t.stop()
+    t.join(timeout=1)
+    assert seen == ["left", "right"]
+
+
 def test_inference_emit_routes_switcher_events_with_dx():
     from collections import deque
 

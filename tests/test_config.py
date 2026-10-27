@@ -142,3 +142,18 @@ def test_project_root_next_to_exe_when_frozen(tmp_path):
     mod = tmp_path / "repo" / "src" / "airmouse" / "config.py"
     assert config.project_root(True, str(exe), str(mod)) == exe.parent.resolve()
     assert config.project_root(False, str(exe), str(mod)) == (tmp_path / "repo").resolve()
+
+
+def test_update_values_keeps_first_backup_and_stamps_each_save(tmp_path):
+    from datetime import datetime
+    path = tmp_path / "config.toml"
+    path.write_bytes(SAMPLE.encode("utf-8"))
+    config.update_values(path, {("gesture", "curl_up"): 0.5}, now=datetime(2026, 1, 1, 10, 0, 0))
+    config.update_values(path, {("gesture", "curl_up"): 0.6}, now=datetime(2026, 1, 1, 10, 5, 0))
+    # .bak = ต้นฉบับครั้งแรก ไม่ถูกเขียนทับ
+    assert path.with_suffix(".toml.bak").read_bytes() == SAMPLE.encode("utf-8")
+    first = tmp_path / "config.toml.20260101-100000.bak"
+    second = tmp_path / "config.toml.20260101-100500.bak"
+    assert first.read_bytes() == SAMPLE.encode("utf-8")
+    assert b"curl_up = 0.5 " in second.read_bytes()   # สำเนาของไฟล์ก่อนบันทึกครั้งที่สอง
+    assert config.load(path).gesture.curl_up == 0.6

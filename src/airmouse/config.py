@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import tomllib
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -290,9 +291,11 @@ def update_toml_text(text: str, updates: dict[tuple[str, str], object]) -> str:
     return "".join(lines)
 
 
-def update_values(path: Path, updates: dict[tuple[str, str], object]) -> None:
+def update_values(path: Path, updates: dict[tuple[str, str], object],
+                  now: datetime | None = None) -> None:
     """เขียนค่าที่เปลี่ยนลงไฟล์ config โดยเก็บ comment: ตรวจความถูกต้องก่อน (error = ไม่เขียนอะไร)
-    สำรองไฟล์เดิมเป็น <ชื่อ>.bak แล้วเขียนแบบ atomic (ไฟล์ชั่วคราว + os.replace)"""
+    สำรองไฟล์เดิม 2 ที่: <ชื่อ>.bak (ครั้งแรกเท่านั้น = ต้นฉบับ ไม่ถูกเขียนทับ)
+    และ <ชื่อ>.<YYYYmmdd-HHMMSS>.bak ทุกครั้ง; แล้วเขียนแบบ atomic (ไฟล์ชั่วคราว + os.replace)"""
     fields = {s.name: {f.name for f in dataclasses.fields(getattr(Config(), s.name))}
               for s in dataclasses.fields(Config)}
     for section, key in updates:
@@ -302,7 +305,11 @@ def update_values(path: Path, updates: dict[tuple[str, str], object]) -> None:
     new = update_toml_text(raw.decode("utf-8"), updates)
     from_dict(tomllib.loads(new))  # ค่าผิดชนิด/นอกช่วง → raise ก่อนเขียน
     if path.exists():
-        shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+        first = path.with_suffix(path.suffix + ".bak")
+        if not first.exists():
+            shutil.copy2(path, first)
+        stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(path, path.with_name(f"{path.name}.{stamp}.bak"))
     tmp = path.with_name(path.name + ".tmp")
     try:
         tmp.write_bytes(new.encode("utf-8"))

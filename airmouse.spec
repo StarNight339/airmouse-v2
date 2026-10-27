@@ -33,12 +33,15 @@ excludes = [
     "PySide6.Qt3DAnimation", "PySide6.Qt3DExtras",
     "PySide6.QtQuick", "PySide6.QtQuick3D", "PySide6.QtQuickWidgets", "PySide6.QtQuickControls2",
     "PySide6.QtQml", "PySide6.QtDesigner", "PySide6.QtCharts", "PySide6.QtDataVisualization",
-    "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets", "PySide6.QtPdf", "PySide6.QtPdfWidgets",
+    # ห้ามตัด QtMultimedia: sound.py ใช้ QSoundEffect
+    "PySide6.QtMultimediaWidgets", "PySide6.QtPdf", "PySide6.QtPdfWidgets",
     "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtBluetooth", "PySide6.QtNfc",
     "PySide6.QtSensors", "PySide6.QtSerialPort", "PySide6.QtPositioning", "PySide6.QtLocation",
     "PySide6.QtRemoteObjects", "PySide6.QtScxml", "PySide6.QtSvgWidgets", "PySide6.QtHelp",
     "PySide6.QtOpenGL", "PySide6.QtOpenGLWidgets", "PySide6.QtNetworkAuth", "PySide6.QtSpatialAudio",
-    "tkinter", "matplotlib", "pytest", "IPython", "notebook", "scipy.tests",
+    # ห้ามตัด matplotlib: mediapipe.tasks.python.vision.drawing_utils import ตอนโหลด mediapipe
+    # (ตัดแล้ว exe พังตั้งแต่ import: ModuleNotFoundError ขึ้นเป็น dialog ตอน console=False)
+    "tkinter", "pytest", "IPython", "notebook", "scipy.tests",
 ]
 
 a = Analysis(

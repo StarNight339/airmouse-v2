@@ -334,6 +334,14 @@ class GestureTracker:
             self._stop_control(events)
         return events
 
+    def set_normal_facing(self, value: int) -> None:
+        """ตั้งด้านปกติของมือใหม่ (หลัง calibrate) ±1 = ใช้ค่านี้, 0 = เรียนรู้ใหม่
+        เรียกตอนการควบคุมถูกพัก (InferenceThread.set_paused) เท่านั้น"""
+        self.normal_sign = value if value in (-1, 1) else 0
+        self._learn.clear()
+        self._learn_t0 = None
+        self._flip_start = None
+
     def request_toggle(self) -> None:
         """thread-safe: ขอสลับ enabled ใช้ที่ต้นรอบ update ถัดไป"""
         with self._req_lock:

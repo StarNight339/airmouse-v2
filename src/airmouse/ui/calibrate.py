@@ -24,6 +24,7 @@ from ..config import Config
 log = logging.getLogger(__name__)
 
 TICK_MS = 30
+HAND_CHANGED_NOTE = "เปลี่ยนมือแล้ว: ระหว่าง calibrate ต้องให้กล้องเห็นมือข้างนั้น"
 STYLE = """
 QWidget { font-family: 'Leelawadee UI', 'Segoe UI', Tahoma; font-size: 14px; }
 QLabel#title { font-size: 30px; font-weight: bold; }
@@ -55,7 +56,8 @@ class CalibrateWindow(QWidget):
         self._inference = inference
         self._cfg = cfg
         self._path = config_path
-        self._session = calibration.CalibrationSession()
+        self._orig_hand = cfg.camera.hand
+        self._session = calibration.CalibrationSession(choose_hand=True, hand=self._orig_hand)
         self._result: calibration.CalibrationResult | None = None
         self._dump_file = dump_path()
         self._done = False
@@ -67,7 +69,6 @@ class CalibrateWindow(QWidget):
         self._build()
         self._center()
 
-        self._session.restart_prepare(time.monotonic())
         self._refresh_pose()
         self._timer = QTimer(self)
         self._timer.setInterval(TICK_MS)
@@ -78,6 +79,35 @@ class CalibrateWindow(QWidget):
     def _build(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 20)
+
+        # --- หน้าเลือกมือข้างที่ใช้ (ขั้นแรก) ---
+        self._hand_page = QWidget()
+        hl = QVBoxLayout(self._hand_page)
+        hl.addWidget(QLabel("ใช้มือข้างไหน?", objectName="title"))
+        hint = QLabel("เลือกมือที่ใช้ควบคุมเมาส์ จากนั้นจะให้ทำท่าทีละท่า")
+        hint.setWordWrap(True)
+        hl.addWidget(hint)
+        hl.addStretch(1)
+        hrow = QHBoxLayout()
+        self._hand_btns: dict[str, QPushButton] = {}
+        for hand, label in (("left", "ซ้าย"), ("right", "ขวา")):
+            b = QPushButton(label)
+            b.setMinimumHeight(110)
+            b.setStyleSheet("font-size: 32px; font-weight: bold;")
+            b.clicked.connect(lambda _=False, h=hand: self._on_hand(h))
+            hrow.addWidget(b)
+            self._hand_btns[hand] = b
+        hl.addLayout(hrow)
+        hl.addStretch(1)
+        hcancel = QPushButton("ยกเลิก")
+        hcancel.clicked.connect(self.close)
+        hl.addWidget(hcancel, 0, Qt.AlignmentFlag.AlignRight)
+        root.addWidget(self._hand_page)
+        pre = self._hand_btns.get(self._orig_hand)
+        if pre is not None:   # เลือกข้างปัจจุบันไว้ก่อน (ไฮไลต์ + Enter กดได้เลย)
+            pre.setDefault(True)
+            pre.setFocus()
+            pre.setStyleSheet("font-size: 32px; font-weight: bold; border: 3px solid #2e86de;")
 
         # --- หน้าเก็บท่า ---
         self._capture = QWidget()
@@ -108,6 +138,7 @@ class CalibrateWindow(QWidget):
         cl.addStretch(1)
         cl.addLayout(row)
         root.addWidget(self._capture)
+        self._capture.hide()
 
         # --- หน้าสรุป ---
         self._review = QWidget()
@@ -148,11 +179,19 @@ class CalibrateWindow(QWidget):
         self._title.setText(spec.title)
         self._text.setText(spec.text)
 
+    def _on_hand(self, hand: str) -> None:
+        """เลือกมือแล้วใช้กับ cfg ที่รันอยู่ทันที เพื่อให้ tracker เห็นมือข้างนั้นระหว่างเก็บท่า"""
+        self._cfg.camera.hand = hand
+        self._session.choose_hand(hand, time.monotonic())
+        self._hand_page.hide()
+        self._capture.show()
+        self._refresh_pose()
+
     def _on_redo_current(self) -> None:
         self._session.restart_prepare(time.monotonic())
 
     def _tick(self) -> None:
-        if self._done:
+        if self._done or self._session.phase == "hand":
             return
         s = self._session
         now = time.monotonic()
@@ -214,12 +253,19 @@ class CalibrateWindow(QWidget):
             row.addWidget(btn)
             self._problem_box.addLayout(row)
         rows = calibration.summary_rows(res, self._cfg.gesture)
+        rows.insert(0, ("hand", self._orig_hand, self._session.hand))
         self._table.setRowCount(len(rows))
         for i, cells in enumerate(rows):
             for j, text in enumerate(cells):
                 self._table.setItem(i, j, QTableWidgetItem(text))
         self._save.setEnabled(bool(res.values))
-        self._message.setText("" if res.values else "ไม่มีค่าที่คำนวณได้ ให้ทำท่าที่มีปัญหาใหม่")
+        notes = []
+        if self._session.hand != self._orig_hand:
+            notes.append(HAND_CHANGED_NOTE)
+        if not res.values:
+            notes.append("ไม่มีค่าที่คำนวณได้ ให้ทำท่าที่มีปัญหาใหม่")
+        self._message.setText("\n".join(notes))
+        self._message.setWordWrap(True)
 
     def _redo_pose(self, pose_id: str) -> None:
         self._review.hide()
@@ -232,6 +278,7 @@ class CalibrateWindow(QWidget):
         if self._result is None or self._done:
             return
         updates: dict[tuple[str, str], object] = dict(self._result.values)
+        updates[("camera", "hand")] = self._session.hand
         updates[("meta", "calibrated")] = datetime.now().isoformat(timespec="seconds")
         try:
             config_mod.update_values(self._path, updates)
@@ -272,6 +319,7 @@ class CalibrateWindow(QWidget):
             self._closing = True
             self._timer.stop()
             if not self._done:
+                self._cfg.camera.hand = self._orig_hand  # ยกเลิก: คืนมือข้างเดิม
                 self._dump()  # ยกเลิกกลางคัน: ยังเก็บตัวอย่างที่ได้ไว้ตรวจย้อนหลัง
             self.closed.emit()
         super().closeEvent(event)

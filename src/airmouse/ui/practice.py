@@ -160,6 +160,25 @@ def summarize(trials: list[dict]) -> dict:
     return out
 
 
+def needs_regen(old: tuple[float, float], new: tuple[float, float]) -> bool:
+    """เป้าที่สุ่มไว้ตามขนาดเก่า ต้องสุ่มใหม่ถ้าขนาดหน้าต่างจริงต่างไป"""
+    return old != new
+
+
+def _fmt(v: float | None, spec: str) -> str:
+    return "-" if v is None else format(v, spec)
+
+
+def format_stage_line(stage: str, s: dict) -> str:
+    """บรรทัดสรุปของด่านบนหน้าผลลัพธ์ ค่า None (เช่น ไม่เคยสำเร็จเลยจึงไม่มีเวลา) แสดงเป็น '-'"""
+    line = (f"แม่นยำ {_fmt(s.get('accuracy'), '.0f')}% ({s.get('hits', 0)}/{s.get('attempts', 0)})   "
+            f"เวลาเฉลี่ย {_fmt(s.get('mean_time_s'), '.2f')} วิ   "
+            f"มัธยฐาน {_fmt(s.get('median_time_s'), '.2f')} วิ")
+    if stage == "scroll":
+        line += f"   เลยกรอบ {s.get('overshoots', 0)} ครั้ง"
+    return line
+
+
 def save_results(logs_dir: Path, trials: list[dict], summary: dict,
                  now: datetime | None = None) -> Path:
     now = now or datetime.now()
@@ -227,10 +246,21 @@ class PracticeWindow(QWidget):
     def showEvent(self, e) -> None:  # noqa: N802
         super().showEvent(e)
         self._layout_buttons()
+        self._regen_click_targets()
 
     def resizeEvent(self, e) -> None:  # noqa: N802
         super().resizeEvent(e)
         self._layout_buttons()
+        self._regen_click_targets()
+
+    def _regen_click_targets(self) -> None:
+        """เป้ารอบแรกสุ่มตอน __init__ (widget ยัง 640x480) ถ้าขนาดจริงเปลี่ยนก่อนเริ่มเล่น สุ่มใหม่"""
+        if (self._stage == "click" and self._ti == 0 and not self._trials
+                and needs_regen(self._targets_size, self._size())):
+            self._targets = make_targets(self._rng, *self._size())
+            self._targets_size = self._size()
+            self._target_t0 = self._clock()
+            self.update()
 
     def _layout_buttons(self) -> None:
         self._skip_btn.adjustSize()
@@ -265,6 +295,7 @@ class PracticeWindow(QWidget):
         w, h = self._size()
         if stage == "click":
             self._targets = make_targets(self._rng, w, h)
+            self._targets_size = (w, h)
             self._ti = 0
             self._target_t0 = self._clock()
             self._dbl_pending = False
@@ -416,6 +447,8 @@ class PracticeWindow(QWidget):
                 self._dragging = True
                 self._grab_off = self._ball_pos - e.position()
                 self.update()
+            else:
+                self._dragging = False  # กัน state ค้างจาก release ที่หายไป
 
     def mouseDoubleClickEvent(self, e: QMouseEvent) -> None:  # noqa: N802
         if self._stage == "click":
@@ -532,12 +565,7 @@ class PracticeWindow(QWidget):
             if not s.get("attempts"):
                 line = "ข้ามด่านนี้"
             else:
-                mean = s["mean_time_s"]
-                med = s["median_time_s"]
-                line = (f"แม่นยำ {s['accuracy']:.0f}% ({s['hits']}/{s['attempts']})   "
-                        f"เวลาเฉลี่ย {mean:.2f} วิ   มัธยฐาน {med:.2f} วิ")
-                if stage == "scroll":
-                    line += f"   เลยกรอบ {s['overshoots']} ครั้ง"
+                line = format_stage_line(stage, s)
             r = QRectF(w / 2 - 480, y, 960, 90)
             p.setPen(Qt.NoPen)
             p.setBrush(PANEL)

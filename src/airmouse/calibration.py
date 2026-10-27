@@ -7,12 +7,13 @@ lo = p5(A), hi = p95(B), g = lo - hi ; down = hi + 0.4g, up = hi + 0.7g
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 from .config import GestureConfig
 from .features import HandFeatures
-from .gestures import switcher_gap
+from .gestures import (is_click_left, is_click_right, is_fist, is_flip, is_pinch,
+                       is_switcher_pose, switcher_gap)
 
 MIN_SAMPLES = 15          # ท่าที่เห็นมือน้อยกว่านี้ใช้ไม่ได้
 MIN_CURL_GAP = 0.02       # ช่องว่างระหว่างสองกลุ่มของ curl ที่ยอมรับ
@@ -195,10 +196,7 @@ def compute(samples: dict[str, list[HandFeatures]], current: GestureConfig) -> C
     if pinch is not None and not in_range(pinch, PINCH_RANGE):
         problem("pinch", "ค่าจีบที่ได้อยู่นอกช่วงที่เหมาะสม ทำท่าจีบใหม่")
         pinch = None
-    # คลิกต้องพับน้อยกว่ากำมือ: เทียบเมื่อได้ทั้งสองค่าใหม่ (ค่าเก่ากับค่าใหม่ไม่ใช่ความผิดของท่าใดท่าหนึ่ง)
-    if click is not None and fist is not None and click[0] <= fist[0]:
-        problem("fist", "กำมือกับพับนิ้วคลิกได้ค่าใกล้กันเกินไป (คลิกต้องพับน้อยกว่ากำมือ) ทำใหม่")
-        click = fist = None
+    # (click_down > curl_down เช็กทีหลังบนค่าที่รวมแล้ว ใน _validate)
 
     if click is not None:
         values[("gesture", "click_curl_down")] = round(click[0], 3)
@@ -247,7 +245,117 @@ def compute(samples: dict[str, list[HandFeatures]], current: GestureConfig) -> C
             lim = 0.7 * percentile([abs(v) for v in facings], 10)
             values[("gesture", "flip_facing_min")] = round(min(0.5, max(0.3, lim)), 3)
 
+    _validate(usable, values, problems, problem, current)
     return CalibrationResult(values, problems, stats)
+
+
+# ---------------------------------------------------------------- ตรวจด้วย predicate จริง
+PASS_FRAC = 0.7           # ท่าเป้าหมายต้องผ่าน predicate อย่างน้อยเท่านี้ของเฟรม
+PLAIN_FRAC = 0.9          # มือปกติต้อง "ไม่เข้าท่าพิเศษใดเลย" อย่างน้อยเท่านี้
+
+# key ที่แต่ละท่าสร้าง (เป็นคู่ ถ้าตกต้องทิ้งทั้งคู่)
+_PRODUCES: dict[str, tuple[str, ...]] = {
+    "fold_index": ("click_curl_down", "click_curl_up"),
+    "fold_middle": ("click_curl_down", "click_curl_up"),
+    "fist": ("curl_down", "curl_up"),
+    "pinch": ("pinch_down", "pinch_up"),
+    "three": ("switcher_gap_on", "switcher_gap_hold"),
+    "flip": ("flip_facing_min",),
+}
+_BLAME = {"fist": "fist", "click_left": "fold_index", "click_right": "fold_middle",
+          "switcher": "three", "pinch": "pinch", "flip": "flip"}
+_REDO = {
+    "fist": "กำมือแล้วไม่เข้าเกณฑ์กำมือที่คำนวณได้ ทำท่านี้ใหม่ (กำให้แน่นและค้างนิ่งกว่านี้)",
+    "fold_index": "พับนิ้วชี้แล้วไม่เข้าเกณฑ์คลิกซ้าย ทำท่านี้ใหม่ (พับนิ้วชี้อย่างเดียว นิ้วอื่นเหยียด)",
+    "fold_middle": "พับนิ้วกลางแล้วไม่เข้าเกณฑ์คลิกขวา ทำท่านี้ใหม่ (พับนิ้วกลางอย่างเดียว)",
+    "three": "ท่าสามนิ้วไม่เข้าเกณฑ์ ทำท่านี้ใหม่ (ชี้ กลาง นางตรง พับก้อยให้ชัด)",
+    "pinch": "จีบนิ้วแล้วไม่เข้าเกณฑ์จีบ ทำท่านี้ใหม่ (จีบให้ชิดและค้างไว้)",
+    "flip": "พลิกมือแล้วไม่เข้าเกณฑ์พลิก ทำท่านี้ใหม่ (พลิกมือให้สุด ให้อีกด้านหันเข้ากล้องชัดๆ)",
+}
+
+
+def _classify(f: HandFeatures, cfg: GestureConfig, normal_sign: int) -> str:
+    """ท่าที่ predicate จริงของ gestures มองเห็น ('plain' = ไม่เข้าท่าพิเศษ)"""
+    c = f.curl
+    if is_flip(f.palm_facing, normal_sign, cfg):
+        return "flip"
+    if is_switcher_pose(c, cfg):
+        return "switcher"
+    if is_pinch(f.pinch, cfg):
+        return "pinch"
+    if is_fist(c, cfg):
+        return "fist"
+    if is_click_left(c, f.pinch, cfg):
+        return "click_left"
+    if is_click_right(c, f.pinch, cfg):
+        return "click_right"
+    return "plain"
+
+
+def _validate(usable: dict[str, list[HandFeatures]], values: dict[Key, float | int],
+              problems: dict[str, str], problem, current: GestureConfig) -> None:  # noqa: ANN001
+    """เอาค่าใหม่ใส่ copy ของ config แล้วรัน predicate จริงกับเฟรมที่เก็บมา
+    ท่าที่ผ่านน้อยกว่า PASS_FRAC → problem + ทิ้ง key ที่ท่านั้นสร้าง (ทั้งคู่) แล้วตรวจใหม่จนนิ่ง"""
+    skip = set(problems)   # ท่าที่มี problem อยู่แล้ว (แยกไม่ออก ฯลฯ) ไม่ต้องตรวจซ้ำ
+    reported: set[str] = set()
+
+    def report(pose: str, msg: str) -> bool:
+        if pose in reported:
+            return False
+        reported.add(pose)
+        problem(pose, msg)
+        for k in _PRODUCES.get(pose, ()):
+            values.pop(("gesture", k), None)
+        return True
+
+    for _ in range(6):
+        cfg2 = replace(current, **{k: v for (_, k), v in values.items()})
+        ns = _sign(cfg2.normal_facing)
+        bad: dict[str, str] = {}
+
+        # คลิกต้องพับน้อยกว่ากำมือ (บนค่าที่รวมเก่า/ใหม่แล้ว)
+        if cfg2.click_curl_down <= cfg2.curl_down:
+            new_click = ("gesture", "click_curl_down") in values
+            new_fist = ("gesture", "curl_down") in values
+            msg = "เกณฑ์คลิกกับกำมือสลับกัน (คลิกต้องพับน้อยกว่ากำมือ) ทำท่ากำมือและพับนิ้วใหม่"
+            if new_fist:
+                bad["fist"] = msg
+            if new_click:
+                bad["fold_index"] = bad["fold_middle"] = msg
+
+        if ns == 0 and "flip" in usable and "relaxed" not in skip:
+            bad["relaxed"] = "บอกด้านปกติของมือไม่ได้ ทำท่ามือปกติใหม่ (หันฝ่ามือเข้าหากล้องให้ชัด)"
+
+        preds = {
+            "fist": lambda f: is_fist(f.curl, cfg2),
+            "fold_index": lambda f: is_click_left(f.curl, f.pinch, cfg2),
+            "fold_middle": lambda f: is_click_right(f.curl, f.pinch, cfg2),
+            "three": lambda f: is_switcher_pose(f.curl, cfg2),
+            "pinch": lambda f: is_pinch(f.pinch, cfg2),
+        }
+        if ns != 0:
+            preds["flip"] = lambda f: is_flip(f.palm_facing, ns, cfg2)
+        for pose, pred in preds.items():
+            if pose in usable and pose not in skip and pose not in bad:
+                frames = usable[pose]
+                if sum(1 for f in frames if pred(f)) < PASS_FRAC * len(frames):
+                    bad[pose] = _REDO[pose]
+
+        if "relaxed" in usable and "relaxed" not in skip:
+            kinds = [_classify(f, cfg2, ns) for f in usable["relaxed"]]
+            plain = kinds.count("plain")
+            if plain < PLAIN_FRAC * len(kinds):
+                top = max((k for k in set(kinds) if k != "plain"), key=kinds.count)
+                blamed = _BLAME[top]
+                bad.setdefault("relaxed", "มือปกติถูกมองเป็นท่าพิเศษ (" + top + ") ทำท่ามือปกติใหม่"
+                               " หรือทำท่าที่เกี่ยวข้องใหม่")
+                bad.setdefault(blamed, _REDO[blamed])
+
+        changed = False
+        for pose, msg in bad.items():
+            changed |= report(pose, msg)
+        if not changed:
+            break
 
 
 # ---------------------------------------------------------------- สรุปสำหรับตาราง UI
@@ -292,12 +400,15 @@ class CalibrationSession:
     redo(pose) จากหน้าสรุป: ทำเฉพาะท่านั้นแล้วกลับ "review"
     """
 
-    def __init__(self, poses: Sequence[PoseSpec] = POSES, prepare_s: float = PREPARE_S) -> None:
+    def __init__(self, poses: Sequence[PoseSpec] = POSES, prepare_s: float = PREPARE_S,
+                 choose_hand: bool = False, hand: str = "right") -> None:
         self.poses = list(poses)
         self.prepare_s = prepare_s
         self.samples: dict[str, list[HandFeatures]] = {p.id: [] for p in self.poses}
         self.index = 0
-        self.phase = "prepare"
+        self.hand = hand            # มือข้างที่ใช้ ("left" | "right")
+        # choose_hand: เริ่มที่ขั้น "hand" (เลือกมือข้างก่อน) แล้วค่อย prepare ของท่าแรก
+        self.phase = "hand" if choose_hand else "prepare"
         self._phase_t0: float | None = None
         self._last_seq: int | None = None
         self._single = False   # redo ท่าเดียว
@@ -313,6 +424,14 @@ class CalibrationSession:
     def _begin(self, phase: str, now: float) -> None:
         self.phase = phase
         self._phase_t0 = now
+
+    def choose_hand(self, hand: str, now: float) -> None:
+        """เลือกมือข้างที่ใช้ แล้วเริ่มนับถอยหลังท่าแรก"""
+        if hand not in ("left", "right"):
+            raise ValueError(f"hand ต้องเป็น left/right ได้ {hand!r}")
+        self.hand = hand
+        self.index = 0
+        self.restart_prepare(now)
 
     def restart_prepare(self, now: float) -> None:
         """เริ่มนับถอยหลังของท่าปัจจุบันใหม่ (ล้างตัวอย่างของท่านี้)"""

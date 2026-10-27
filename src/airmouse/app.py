@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import ctypes
 import json
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 from collections import deque
@@ -270,8 +272,11 @@ class InferenceThread(threading.Thread):
 
     def __init__(self, camera: Camera, tracker: HandTracker, mirror: bool, debug: bool,
                  controller: Controller | None = None, log_pose: bool = False,
-                 lifecycle: Lifecycle | None = None, low_power_fps: float = 6.0):
+                 lifecycle: Lifecycle | None = None, low_power_fps: float = 6.0,
+                 hand_source=None):  # noqa: ANN001
         super().__init__(name="inference", daemon=True)
+        # hand_source() -> "left"/"right": อ่านข้างมือจาก cfg ทุกเฟรม (calibrate เปลี่ยนได้ระหว่างรัน)
+        self._hand_source = hand_source
         self._camera = camera
         self._tracker = tracker
         self._controller = controller
@@ -348,6 +353,8 @@ class InferenceThread(threading.Thread):
                 last_processed = ts
                 if self._mirror:
                     frame = cv2.flip(frame, 1)
+                if self._hand_source is not None:
+                    self._tracker.hand = self._hand_source()
                 t0 = time.perf_counter()
                 hand = self._tracker.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), ts)
                 feats = None
@@ -471,13 +478,17 @@ def _describe_pose(f: HandFeatures, g: GestureState | None) -> str:
 def _setup_logging(debug: bool) -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     handlers[0].setLevel(logging.INFO)
-    if debug:
-        config_mod.LOGS_DIR.mkdir(exist_ok=True)
-        path = config_mod.LOGS_DIR / f"airmouse-{datetime.now():%Y%m%d-%H%M%S}.log"
-        fh = logging.FileHandler(path, encoding="utf-8")
-        fh.setLevel(logging.DEBUG)
-        handlers.append(fh)
-        print(f"debug log: {path}", flush=True)
+    # .exe ไม่มี console: เขียน log ลงไฟล์เสมอ (INFO) ไม่งั้นพังแล้วไม่มีร่องรอย
+    if debug or FROZEN:
+        try:
+            config_mod.LOGS_DIR.mkdir(exist_ok=True)
+            path = config_mod.LOGS_DIR / f"airmouse-{datetime.now():%Y%m%d-%H%M%S}.log"
+            fh = logging.FileHandler(path, encoding="utf-8")
+            fh.setLevel(logging.DEBUG if debug else logging.INFO)
+            handlers.append(fh)
+            print(f"log: {path}", flush=True)
+        except OSError as e:  # โฟลเดอร์เขียนไม่ได้ (เช่นติดตั้งใน Program Files)
+            print(f"เขียน log ไม่ได้: {e}", flush=True)
     logging.basicConfig(
         level=logging.DEBUG if debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s",
@@ -485,6 +496,19 @@ def _setup_logging(debug: bool) -> None:
     )
     # comtypes log ทุก AddRef/Release ที่ DEBUG (หลายพันบรรทัด/นาที) → ปิดไว้
     logging.getLogger("comtypes").setLevel(logging.WARNING)
+
+
+FROZEN = bool(getattr(sys, "frozen", False))  # รันจาก .exe (PyInstaller)
+
+
+def _fatal(msg: str) -> None:
+    """แจ้ง error ที่ทำให้เริ่มไม่ได้: log เสมอ + กล่องข้อความถ้าเป็น .exe (ไม่มี terminal ให้เห็น)"""
+    log.error(msg)
+    if FROZEN:
+        try:
+            ctypes.windll.user32.MessageBoxW(None, msg, "Air Mouse", 0x10)  # MB_ICONERROR
+        except Exception:  # noqa: BLE001
+            pass
 
 
 EXIT_NOTIFY_MS = 2500  # แสดงแจ้งเตือน "ปิดแล้ว" ก่อนออกจริง
@@ -651,13 +675,17 @@ class _AppUI:
             from .ui.calibrate import CalibrateWindow
             self._inference.set_paused(True)  # ทำท่าตามขั้นตอนต้องไม่คลิก/ลากของจริง
             self._calibrate = CalibrateWindow(self._inference, self._cfg, self._args.config)
-            self._calibrate.saved.connect(
-                lambda values: log.info("calibrate: บันทึก %d ค่าลง %s", len(values),
-                                        self._args.config))
+            self._calibrate.saved.connect(self._calibrate_saved)
             self._calibrate.closed.connect(self._calibrate_closed)
         self._calibrate.show()
         self._calibrate.raise_()
         self._calibrate.activateWindow()
+
+    def _calibrate_saved(self, values: dict) -> None:
+        log.info("calibrate: บันทึก %d ค่าลง %s", len(values), self._args.config)
+        # GestureTracker จำด้านปกติของมือไว้ตอนสร้าง → ตั้งใหม่ตรงนี้ (ยังพักอยู่ ปลอดภัย)
+        if ("gesture", "normal_facing") in values:
+            self._gestures.set_normal_facing(values[("gesture", "normal_facing")])
 
     def _calibrate_closed(self) -> None:
         self._calibrate = None
@@ -768,7 +796,8 @@ def run(args: argparse.Namespace) -> int:
         tracker = HandTracker(model_path, cfg.camera.hand, cfg.camera.mirror,
                               cfg.gesture.min_presence)
         if not camera.wait_opened(CAMERA_OPEN_TIMEOUT_S):
-            log.error("เริ่มกล้องไม่สำเร็จ: %s", camera.error or "หมดเวลารอเฟรมแรก")
+            _fatal("เริ่มกล้องไม่สำเร็จ: " + (camera.error or "หมดเวลารอเฟรมแรก")
+                   + "\n(ถ้าเปิด Air Mouse ซ้อนอยู่อีกตัว หรือโปรแกรมอื่นใช้กล้อง ให้ปิดก่อน)")
             return 1
 
         mouse = win_mouse.MouseThread()
@@ -796,7 +825,8 @@ def run(args: argparse.Namespace) -> int:
         lifecycle = Lifecycle(cfg.app, stay=args.stay)
         inference = InferenceThread(camera, tracker, cfg.camera.mirror, args.debug, controller,
                                     log_pose=args.log_pose, lifecycle=lifecycle,
-                                    low_power_fps=cfg.app.low_power_fps)
+                                    low_power_fps=cfg.app.low_power_fps,
+                                    hand_source=lambda: cfg.camera.hand)
         inference.start()
 
         app = QApplication.instance() or QApplication([])
@@ -805,7 +835,8 @@ def run(args: argparse.Namespace) -> int:
 
         def watchdog() -> None:
             if not inference.is_alive():
-                log.error("หยุดทำงาน: %s", inference.error or camera.error or "inference thread จบเอง")
+                _fatal("Air Mouse หยุดทำงาน: "
+                       + (inference.error or camera.error or "inference thread จบเอง"))
                 ui.exit_code = 1
                 app.quit()
 
