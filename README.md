@@ -5,6 +5,15 @@
 
 แผนและข้อกำหนดทั้งหมดอยู่ใน [PLAN.md](PLAN.md)
 
+## ดาวน์โหลด (ไม่ต้องติดตั้ง Python)
+
+1. โหลด `AirMouse-v*-windows-x64.zip` จากหน้า [Releases](https://github.com/StarNight339/airmouse-v2/releases)
+2. แตก zip ไปไว้ที่ไหนก็ได้ที่เขียนไฟล์ได้ (เช่น `Documents\AirMouse`) แล้วเปิด `airmouse.exe`
+3. ไอคอนจะขึ้นใน system tray ครั้งแรกให้คลิกขวา → **Calibrate…** แล้วเลือกมือที่ใช้และทำท่าตามขั้นตอน
+4. พลิกมือค้าง 0.7 วิเพื่อเริ่มควบคุม
+
+ต้องมีเว็บแคม และใช้ได้บน Windows 10/11 แบบ 64-bit ค่าที่ตั้งไว้กับ log อยู่ในโฟลเดอร์เดียวกับ `airmouse.exe`
+
 ## ท่ามือ
 
 ### ควบคุมเมาส์
@@ -106,6 +115,11 @@ powershell -ExecutionPolicy Bypass -File tools\build_exe.ps1
 ได้โฟลเดอร์ `dist\airmouse\` ที่มี `airmouse.exe` พร้อม `config.toml` และ `logs\` อยู่ข้างกัน
 ทั้งโฟลเดอร์ย้ายไปเครื่องอื่นได้ (ไม่ต้องติดตั้ง Python) ตัว .exe ไม่มีหน้าต่าง terminal ใช้งานผ่าน tray
 
+- build ซ้ำจะเก็บ `config.toml` ที่ calibrate แล้วและ `logs\` ใน `dist\airmouse` ไว้ให้
+- ไอคอนสร้างด้วย `tools\make_icon.py` (ได้ `assets\airmouse.ico`)
+- แพ็กเป็น zip สำหรับแจก: `.venv\Scripts\python.exe tools\package_release.py` จะได้ `dist\AirMouse-v<version>-windows-x64.zip`
+  ซึ่งใช้ config กลาง (มือขวา, ยังไม่ calibrate) และไม่มี log ของเครื่องนี้
+
 ## เทสต์
 
 ```powershell
@@ -115,5 +129,5 @@ powershell -ExecutionPolicy Bypass -File tools\build_exe.ps1
 ## โครงสร้าง
 
 - `src/airmouse/`: โค้ดหลัก (ดูรายละเอียดใน `CLAUDE.md`)
-- `tools/`: `replay_pose.py` (replay log), `build_exe.ps1` (สร้าง .exe)
+- `tools/`: `replay_pose.py` (replay log), `build_exe.ps1` (สร้าง .exe), `package_release.py` (zip สำหรับแจก), `make_icon.py` (ไอคอน)
 - `prototype/airmouse_prototype.py`: ต้นแบบไฟล์เดียวรุ่นแรก เก็บไว้อ้างอิง

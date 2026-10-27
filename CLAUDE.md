@@ -43,7 +43,16 @@
     - activate สลับหน้าต่างได้จริงไหม
     - ความเร็วปัดขึ้น (เกณฑ์ 6 hand/s อาจสูงไป)
     - `switcher_step` 0.4
-- **Phase 6 (calibrate, โหมดฝึก, polish):** ยังไม่เริ่ม
+- **Phase 6 (calibrate, โหมดฝึก, .exe, ไอคอน):** เสร็จ, push และออก release `v0.1.0` (2026-10-27)
+  - **ไฟล์:** `calibration.py`, `ui/calibrate.py`, `ui/practice.py`, `airmouse.spec`, `tools/build_exe.ps1`, `tools/package_release.py`, `tools/make_icon.py`
+  - **calibrate ทดสอบสดผ่าน .exe แล้ว:** 7 ท่าไม่มี problem, เลือกมือซ้ายได้, บันทึกเก็บ comment + `.bak`
+    - **น่าห่วง:** ค่าที่ได้หลวมกว่าค่าจูนมือ (`click_curl_down` 0.858 เทียบกับ 0.77, `pinch_down` 3.5 เทียบกับ 2.2 cm) และใน log มีลากสั้นๆ 0.16–0.19 วิหลายครั้ง
+    - ต้องดูว่าคลิก/ลากเองไหม แล้วอาจต้องเพิ่มพื้นจาก noise ตอนใช้จริงแบบเดียวกับ switcher
+  - **ยังไม่ได้ทดสอบสด:** โหมดฝึกครบ 3 ด่าน (ยังไม่มีไฟล์ `practice-*.json`)
+  - **.exe:**
+    - `dist\airmouse` (~420 MB) ใช้ config ข้าง exe ซึ่ง calibrate แล้ว
+    - release zip สร้างด้วย `package_release.py` ใช้ config กลาง
+    - shortcut ใน Start Menu ชี้ไปที่ `dist\airmouse\airmouse.exe`
 
 ## ผู้ใช้
 - คุยภาษาไทย ใช้**มือซ้าย** (`config.toml`: `hand = "left"`, `normal_facing = -1`)

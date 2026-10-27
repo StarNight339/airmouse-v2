@@ -831,6 +831,10 @@ def run(args: argparse.Namespace) -> int:
 
         app = QApplication.instance() or QApplication([])
         app.setQuitOnLastWindowClosed(False)  # อยู่ใน tray; ปิดหน้าต่าง debug ไม่ได้แปลว่าออก
+        icon_path = config_mod.PROJECT_ROOT / "assets" / "airmouse.ico"  # สร้างด้วย tools/make_icon.py
+        if icon_path.exists():
+            from PySide6.QtGui import QIcon
+            app.setWindowIcon(QIcon(str(icon_path)))  # ไอคอนของหน้าต่าง calibrate/โหมดฝึก/debug
         ui = _AppUI(app, cfg, args, inference, controller.gestures)
 
         def watchdog() -> None:
